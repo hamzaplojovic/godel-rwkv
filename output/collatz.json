@@ -1,0 +1,20 @@
+{
+  "easy": {
+    "model_acc": 1.0,
+    "last_token_acc": 0.16161616161616163,
+    "contains_collapse_acc": 1.0,
+    "n_examples": 99
+  },
+  "hard": {
+    "model_acc": 0.99,
+    "last_token_acc": 0.38,
+    "contains_collapse_acc": 1.0,
+    "n_examples": 200
+  },
+  "budget": {
+    "model_acc": 1.0,
+    "last_token_acc": 1.0,
+    "contains_collapse_acc": 1.0,
+    "n_examples": 8
+  }
+}

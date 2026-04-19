@@ -1,5 +1,5 @@
 """
-ski.py — SKI Combinatory Logic formal system.
+ski.py — SKI Combinatory Logic formal system (v2 encoding).
 
 SKI is a Turing-complete rewriting system. Any computable function can be
 expressed using just three combinators: S, K, and I.
@@ -16,38 +16,115 @@ Two outcomes:
 The canonical stuck term is omega = (S I I)(S I I), which reduces to itself
 forever. This is the SKI equivalent of the liar's paradox.
 
-5-token universal search vocabulary (shared across all formal systems):
-  NEW(0)      — first visit to this term's hash
-  REVISIT(1)  — hash seen before → cycle detected → STUCK
-  BRANCH(2)   — multiple redexes present (fan-out > 1)
-  COLLAPSE(3) — no redexes remaining → normal form → SOLVABLE
-  BACK(4)     — size/step limit hit → STUCK
-
-Special tokens:
-  PAD(5), CLS(6)
-
-Vocab size: 7
+v2 vocabulary — raw state bucket encoding:
+  System-specific bucket ranges: SKI 0-31, Lambda 32-63, TM 64-95
+  TM buckets never seen during training → true cross-vocabulary zero-shot.
+  No REVISIT token — model must detect cycles from repeated bucket IDs.
+  END always last token — last-token classification impossible.
+  Solvable: [...buckets..., COLLAPSE_V2, END_V2]
+  Stuck:    [...buckets..., END_V2]
 """
 
 import random
 from typing import Optional
 from dataclasses import dataclass
 
-NEW = 0
-REVISIT = 1
-BRANCH = 2
-COLLAPSE = 3
-BACK = 4
-PAD = 5
-CLS = 6
-VOCAB_SIZE = 7
-
 LABEL_SOLVABLE = 0
 LABEL_STUCK = 1
 
-MAX_SEQ_LEN = 64  # solvable traces: 2-13 tokens; stuck: hit size limit by ~30 steps
-MAX_STEPS = 60  # enough to catch divergence, short enough for fast training
-MAX_TERM_SIZE = 35  # omega-like terms explode fast; 35 catches divergence earl
+MAX_TERM_SIZE = 35  # omega-like terms explode fast; 35 catches divergence early
+
+# ---------------------------------------------------------------------------
+# v2 vocabulary — raw state bucket encoding
+#
+# Key fixes over v1:
+#   1. No REVISIT token — model must detect cycles from repeated bucket IDs
+#   2. System-specific bucket ranges — SKI 0-31, Lambda 32-63, TM 64-95
+#      TM buckets never seen during training → true cross-vocabulary zero-shot
+#   3. END always last token (neutral) — model cannot classify from last position
+#   4. Solvable traces: [...buckets..., COLLAPSE_V2, END_V2]
+#      Stuck traces:    [...buckets..., END_V2]  (no COLLAPSE_V2 anywhere)
+# ---------------------------------------------------------------------------
+
+SKI_BUCKET_BASE   = 0    # 0-31:  SKI state buckets
+LAM_BUCKET_BASE   = 32   # 32-63: Lambda state buckets
+TM_BUCKET_BASE    = 64   # 64-95: TM state buckets
+N_BUCKETS         = 32   # buckets per system
+COLLAPSE_V2       = 96   # computation reached normal form — solvable signal
+END_V2            = 97   # always last token, all traces (neutral)
+PAD_V2            = 98
+CLS_V2            = 99
+VOCAB_SIZE_V2     = 100
+
+MAX_SEQ_LEN_V2    = 80   # traces are short: omega=3 tokens, budget-exhausted SKI ~35
+MAX_STEPS_V2      = 75
+
+
+def ski_bucket(state_hash: int) -> int:
+    return SKI_BUCKET_BASE + (state_hash % N_BUCKETS)
+
+
+def pad_trace_v2(toks: list[int], maxlen: int) -> list[int]:
+    """Left-pad with PAD_V2, append CLS_V2 sentinel at end."""
+    toks = toks + [CLS_V2]
+    if len(toks) >= maxlen:
+        return toks[:maxlen]
+    return [PAD_V2] * (maxlen - len(toks)) + toks
+
+
+def generate_ski_trace_v2(term: "Term") -> tuple[list[int], int]:
+    """
+    v2 encoding: raw SKI state bucket IDs, no REVISIT token.
+
+    Each reduction step emits a bucket ID (0-31) derived from the term hash.
+    Cycle detection is NOT done by the engine — the model must detect repeated
+    bucket IDs itself. The engine only terminates early when it detects a cycle
+    to bound trace length; it does NOT emit a special cycle token.
+
+    Solvable: [...bucket_ids..., COLLAPSE_V2, END_V2]
+    Stuck:    [...bucket_ids..., END_V2]  (cycling or budget exhausted)
+
+    END_V2 is always the last token. The model cannot classify by last-token alone.
+    """
+    tokens: list[int] = []
+    seen_hashes: set[int] = set()
+    t = term
+
+    for _ in range(MAX_STEPS_V2):
+        if len(tokens) >= MAX_SEQ_LEN_V2 - 2:
+            tokens.append(END_V2)
+            return tokens, LABEL_STUCK
+
+        sz = term_size(t)
+        if sz > MAX_TERM_SIZE:
+            tokens.append(END_V2)
+            return tokens, LABEL_STUCK
+
+        n_redex = count_redexes(t)
+        if n_redex == 0:
+            tokens.append(COLLAPSE_V2)
+            tokens.append(END_V2)
+            return tokens, LABEL_SOLVABLE
+
+        h = term_hash(t)
+        tokens.append(ski_bucket(h))
+
+        # Cycle detected: terminate without emitting REVISIT.
+        # Model must infer stuck from seeing this bucket ID earlier in the trace.
+        if h in seen_hashes:
+            tokens.append(END_V2)
+            return tokens, LABEL_STUCK
+        seen_hashes.add(h)
+
+        new_t = reduce_one_step(t)
+        if new_t is None:
+            tokens.append(COLLAPSE_V2)
+            tokens.append(END_V2)
+            return tokens, LABEL_SOLVABLE
+        t = new_t
+
+    tokens.append(END_V2)
+    return tokens, LABEL_STUCK
 
 
 @dataclass(frozen=True)
@@ -157,49 +234,6 @@ def reduce_one_step(t: Term) -> Optional[Term]:
     return None
 
 
-def generate_ski_trace(term: Term) -> tuple[list[int], int]:
-    """
-    Run leftmost-outermost reduction, emitting 5-token vocabulary.
-    Returns (tokens, label).
-    """
-    tokens: list[int] = []
-    seen_hashes: set[int] = set()
-    t = term
-
-    for _ in range(MAX_STEPS):
-        if len(tokens) >= MAX_SEQ_LEN - 2:
-            tokens.append(BACK)
-            return tokens, LABEL_STUCK
-
-        sz = term_size(t)
-        if sz > MAX_TERM_SIZE:
-            tokens.append(BACK)
-            return tokens, LABEL_STUCK
-
-        n_redex = count_redexes(t)
-
-        if n_redex == 0:
-            tokens.append(COLLAPSE)
-            return tokens, LABEL_SOLVABLE
-
-        if n_redex > 1:
-            tokens.append(BRANCH)
-
-        h = term_hash(t)
-        if h in seen_hashes:
-            tokens.append(REVISIT)
-            return tokens, LABEL_STUCK
-        seen_hashes.add(h)
-        tokens.append(NEW)
-
-        new_t = reduce_one_step(t)
-        if new_t is None:
-            tokens.append(COLLAPSE)
-            return tokens, LABEL_SOLVABLE
-        t = new_t
-
-    tokens.append(BACK)
-    return tokens, LABEL_STUCK
 
 
 def omega() -> Term:
@@ -229,43 +263,3 @@ def random_term(size: int, var_names: int = 4) -> Term:
     return App(random_term(left_size, var_names), random_term(right_size, var_names))
 
 
-def pad_trace(toks: list[int], maxlen: int) -> list[int]:
-    """Left-pad so meaningful tokens end at position -1.
-    h[:, -1, :] reads immediately after the last real token (COLLAPSE/REVISIT/BACK),
-    regardless of trace length — avoids PAD-decay killing long-trace signals.
-    """
-    toks = toks + [CLS]  # CLS at end acts as sentinel after content
-    if len(toks) >= maxlen:
-        return toks[:maxlen]
-    return [PAD] * (maxlen - len(toks)) + toks
-
-
-if __name__ == "__main__":
-    print("=== SKI Data Sanity Check ===\n")
-
-    # Omega cycles
-    om = omega()
-    toks, lbl = generate_ski_trace(om)
-    print(f"Omega:   tokens={toks[:10]}... label={'STUCK' if lbl == 1 else 'SOLVABLE'}")
-    assert lbl == LABEL_STUCK, "Omega must be STUCK"
-
-    # I I -> I (terminates)
-    ii = App(IDENTITY_COMBINATOR, IDENTITY_COMBINATOR)
-    toks, lbl = generate_ski_trace(ii)
-    print(f"I I:     tokens={toks} label={'STUCK' if lbl == 1 else 'SOLVABLE'}")
-    assert lbl == LABEL_SOLVABLE
-
-    # K I Omega -> I (K discards right arg)
-    ki_om = App(App(K_COMBINATOR, IDENTITY_COMBINATOR), omega())
-    toks, lbl = generate_ski_trace(ki_om)
-    print(f"K I Om:  tokens={toks[:10]}... label={'STUCK' if lbl == 1 else 'SOLVABLE'}")
-    assert lbl == LABEL_SOLVABLE, "K I Omega should be SOLVABLE"
-
-    # S K K x -> x
-    x = Var(0)
-    skk = App(App(App(S_COMBINATOR, K_COMBINATOR), K_COMBINATOR), x)
-    toks, lbl = generate_ski_trace(skk)
-    print(f"S K K v: tokens={toks} label={'STUCK' if lbl == 1 else 'SOLVABLE'}")
-    assert lbl == LABEL_SOLVABLE
-
-    print("\nAll sanity checks passed.")

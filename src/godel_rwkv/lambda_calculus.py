@@ -1,12 +1,5 @@
 """
-lc.py — Untyped Lambda Calculus formal system.
-
-Encodes untyped lambda calculus using the same 5-token vocabulary as SKI:
-  NEW(0)      - first visit to this term hash
-  REVISIT(1)  - cycle detected
-  BRANCH(2)   - multiple redexes present
-  COLLAPSE(3) - beta-normal form reached
-  BACK(4)     - size/step limit hit
+lambda_calculus.py — Untyped Lambda Calculus formal system (v2 encoding).
 
 Lambda calculus terms:
   Var(n)        - de Bruijn index
@@ -19,9 +12,6 @@ Reduction: leftmost-outermost beta reduction.
 Diverging terms (Godel analogs):
   Omega_lam = (lambda. 0 0)(lambda. 0 0)  — same as SKI omega
   Y f = f (Y f)  — fixed point
-
-Usage:
-    from godel_rwkv.lambda_calculus import build_lambda_test_set, generate_lambda_trace
 """
 
 import random
@@ -30,17 +20,16 @@ import mlx.core as mx
 from typing import Optional
 from dataclasses import dataclass
 from godel_rwkv.ski import (
-    BACK,
-    BRANCH,
-    COLLAPSE,
     LABEL_SOLVABLE,
     LABEL_STUCK,
-    MAX_SEQ_LEN,
-    MAX_STEPS,
     MAX_TERM_SIZE,
-    NEW,
-    REVISIT,
-    pad_trace,
+    LAM_BUCKET_BASE,
+    N_BUCKETS,
+    COLLAPSE_V2,
+    END_V2,
+    MAX_SEQ_LEN_V2,
+    MAX_STEPS_V2,
+    pad_trace_v2,
 )
 
 
@@ -147,45 +136,53 @@ def count_beta_redexes(t: LTerm) -> int:
     return n
 
 
-def generate_lambda_trace(term: LTerm) -> tuple[list[int], int]:
-    """Same encoding as SKI traces. Returns (tokens, label)."""
+def lam_bucket(state_hash: int) -> int:
+    return LAM_BUCKET_BASE + (state_hash % N_BUCKETS)
+
+
+def generate_lambda_trace_v2(term: LTerm) -> tuple[list[int], int]:
+    """
+    v2 encoding: raw Lambda state bucket IDs (32-63), no REVISIT token.
+    Same contract as generate_ski_trace_v2 — see ski.py for design notes.
+    """
     tokens: list[int] = []
     seen: set[int] = set()
     t = term
 
-    for _ in range(MAX_STEPS):
-        if len(tokens) >= MAX_SEQ_LEN - 2:
-            tokens.append(BACK)
+    for _ in range(MAX_STEPS_V2):
+        if len(tokens) >= MAX_SEQ_LEN_V2 - 2:
+            tokens.append(END_V2)
             return tokens, LABEL_STUCK
 
-        if lterm_size(t) > MAX_TERM_SIZE:
-            tokens.append(BACK)
+        if lterm_size(t) > MAX_TERM_SIZE:  # type: ignore[arg-type]
+            tokens.append(END_V2)
             return tokens, LABEL_STUCK
 
-        n_redex = count_beta_redexes(t)
-
+        n_redex = count_beta_redexes(t)  # type: ignore[arg-type]
         if n_redex == 0:
-            tokens.append(COLLAPSE)
+            tokens.append(COLLAPSE_V2)
+            tokens.append(END_V2)
             return tokens, LABEL_SOLVABLE
 
-        if n_redex > 1:
-            tokens.append(BRANCH)
+        h = lterm_hash(t)  # type: ignore[arg-type]
+        tokens.append(lam_bucket(h))
 
-        h = lterm_hash(t)
         if h in seen:
-            tokens.append(REVISIT)
+            tokens.append(END_V2)
             return tokens, LABEL_STUCK
         seen.add(h)
-        tokens.append(NEW)
 
-        new_t = beta_step(t)
+        new_t = beta_step(t)  # type: ignore[arg-type]
         if new_t is None:
-            tokens.append(COLLAPSE)
+            tokens.append(COLLAPSE_V2)
+            tokens.append(END_V2)
             return tokens, LABEL_SOLVABLE
         t = new_t
 
-    tokens.append(BACK)
+    tokens.append(END_V2)
     return tokens, LABEL_STUCK
+
+
 
 
 def omega_lam() -> LTerm:
@@ -267,45 +264,3 @@ def sample_solvable_lambda_term(max_size: int) -> LTerm:
     return LApp(LApp(cond, a), b)
 
 
-def build_lambda_test_set(
-    n_per_class: int = 500,
-    seed: int = 77,
-) -> dict:
-    """
-    Build lambda calculus test set.
-    Tests whether SKI-trained model generalizes to lambda calculus.
-    """
-    random.seed(seed)
-    solvable: list[list[int]] = []
-    stuck: list[list[int]] = []
-    max_attempts = n_per_class * _MAX_ATTEMPTS_LAM
-
-    attempts = 0
-    while len(solvable) < n_per_class and attempts < max_attempts:
-        attempts += 1
-        t = sample_solvable_lambda_term(8)
-        toks, lbl = generate_lambda_trace(t)
-        if lbl == LABEL_SOLVABLE:
-            solvable.append(toks)
-
-    attempts = 0
-    while len(stuck) < n_per_class and attempts < max_attempts:
-        attempts += 1
-        t = sample_stuck_lambda_term(8)
-        toks, lbl = generate_lambda_trace(t)
-        if lbl == LABEL_STUCK:
-            stuck.append(toks)
-
-    all_pairs = [(t, LABEL_SOLVABLE) for t in solvable] + [
-        (t, LABEL_STUCK) for t in stuck
-    ]
-    random.shuffle(all_pairs)
-
-    seqs = mx.array([pad_trace(t, MAX_SEQ_LEN) for t, _ in all_pairs], dtype=mx.int32)
-    labels = mx.array([lbl for _, lbl in all_pairs], dtype=mx.int32)
-
-    n_sol = sum(1 for _, lbl in all_pairs if lbl == LABEL_SOLVABLE)
-    n_stk = sum(1 for _, lbl in all_pairs if lbl == LABEL_STUCK)
-    print(f"Lambda OOD: {len(all_pairs)} examples (solvable={n_sol}, stuck={n_stk})")
-
-    return {"seqs": seqs, "labels": labels, "n_sol": n_sol, "n_stk": n_stk}

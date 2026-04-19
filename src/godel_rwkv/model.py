@@ -15,7 +15,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from godel_rwkv.ski import VOCAB_SIZE
+from godel_rwkv.ski import VOCAB_SIZE_V2 as VOCAB_SIZE
 
 
 def time_shift(x: mx.array) -> mx.array:

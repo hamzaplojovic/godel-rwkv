@@ -1,0 +1,65 @@
+[
+  {
+    "n": 1,
+    "true_steps": "1",
+    "trace_steps": 1,
+    "model_pred": "SOLVABLE",
+    "trace_correct": true,
+    "math_correct": true,
+    "terminated_in_budget": true
+  },
+  {
+    "n": 2,
+    "true_steps": "3",
+    "trace_steps": 3,
+    "model_pred": "SOLVABLE",
+    "trace_correct": true,
+    "math_correct": true,
+    "terminated_in_budget": true
+  },
+  {
+    "n": 3,
+    "true_steps": "5",
+    "trace_steps": 5,
+    "model_pred": "SOLVABLE",
+    "trace_correct": true,
+    "math_correct": true,
+    "terminated_in_budget": true
+  },
+  {
+    "n": 4,
+    "true_steps": ">200000",
+    "trace_steps": 74,
+    "model_pred": "STUCK",
+    "trace_correct": true,
+    "math_correct": false,
+    "terminated_in_budget": false
+  },
+  {
+    "n": 5,
+    "true_steps": ">200000",
+    "trace_steps": 74,
+    "model_pred": "STUCK",
+    "trace_correct": true,
+    "math_correct": false,
+    "terminated_in_budget": false
+  },
+  {
+    "n": 6,
+    "true_steps": ">200000",
+    "trace_steps": 74,
+    "model_pred": "STUCK",
+    "trace_correct": true,
+    "math_correct": false,
+    "terminated_in_budget": false
+  },
+  {
+    "n": 7,
+    "true_steps": ">200000",
+    "trace_steps": 74,
+    "model_pred": "STUCK",
+    "trace_correct": true,
+    "math_correct": false,
+    "terminated_in_budget": false
+  }
+]
