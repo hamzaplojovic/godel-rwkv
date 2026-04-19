@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Model weights — large binary files, reproduce with: uv run train.py
+output/*.npz
+
+# Training logs and history — reproduced on each run
+output/*.log
+output/*.txt
+output/history_*.json
+
+# Agent monitor — work in progress, not part of v1 release
+agent_monitor.py
