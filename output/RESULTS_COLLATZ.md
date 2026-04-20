@@ -18,7 +18,7 @@ using the TM bucket range (64-95) — the same range used in the standard zero-s
 | Tier | n range | Examples | GodelRWKV v2 | ContainsCollapse | LastToken |
 |---|---|---|---|---|---|
 | Easy | 2-100 | 99 | 1.0000 | 1.0000 | 0.1616 |
-| Hard | 101-2000 | 200 | 0.9900 | 1.0000 | 0.3800 |
+| Hard | 101-2000 | 200 | 0.9950 | 1.0000 | 0.3800 |
 | Budget | large n | 8 | 1.0000 | 1.0000 | 1.0000 |
 
 ## Budget Boundary (The Undecidability Gap)

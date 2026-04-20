@@ -21,8 +21,12 @@ v2 vocabulary — raw state bucket encoding:
   TM buckets never seen during training → true cross-vocabulary zero-shot.
   No REVISIT token — model must detect cycles from repeated bucket IDs.
   END always last token — last-token classification impossible.
-  Solvable: [...buckets..., COLLAPSE_V2, END_V2]
+  Solvable: [...buckets..., COLLAPSE_V2, ...result_tail..., END_V2]
   Stuck:    [...buckets..., END_V2]
+
+  Result tail: 1-5 bucket IDs emitted after COLLAPSE_V2 (hash of final state).
+  Variable length prevents penultimate-position shortcut — the model must scan
+  the full trace to find COLLAPSE_V2.
 """
 
 import random
@@ -37,13 +41,15 @@ MAX_TERM_SIZE = 35  # omega-like terms explode fast; 35 catches divergence early
 # ---------------------------------------------------------------------------
 # v2 vocabulary — raw state bucket encoding
 #
-# Key fixes over v1:
+# Design:
 #   1. No REVISIT token — model must detect cycles from repeated bucket IDs
 #   2. System-specific bucket ranges — SKI 0-31, Lambda 32-63, TM 64-95
 #      TM buckets never seen during training → true cross-vocabulary zero-shot
 #   3. END always last token (neutral) — model cannot classify from last position
-#   4. Solvable traces: [...buckets..., COLLAPSE_V2, END_V2]
+#   4. Solvable traces: [...buckets..., COLLAPSE_V2, ...result_tail..., END_V2]
 #      Stuck traces:    [...buckets..., END_V2]  (no COLLAPSE_V2 anywhere)
+#   5. Result tail (1-5 bucket IDs after COLLAPSE_V2) prevents penultimate-
+#      position shortcut — the model must scan the full sequence
 # ---------------------------------------------------------------------------
 
 SKI_BUCKET_BASE   = 0    # 0-31:  SKI state buckets
@@ -64,6 +70,28 @@ def ski_bucket(state_hash: int) -> int:
     return SKI_BUCKET_BASE + (state_hash % N_BUCKETS)
 
 
+def emit_result_tail(tokens: list[int], bucket_base: int, state_hash: int, max_n: int = 5) -> None:
+    """
+    Emit 1-max_n result bucket IDs after COLLAPSE_V2, before END_V2.
+
+    The result tail represents a hash of the computation's final state.
+    Its variable length (1-5 tokens, deterministic from state_hash) prevents
+    the model from using a fixed positional shortcut to detect COLLAPSE_V2.
+    The model must scan the full sequence to find COLLAPSE_V2.
+
+    Without this: COLLAPSE_V2 always at position -3 (before END_V2, CLS_V2)
+    → a PenultimateTokenClassifier achieves 100%.
+    With this: penultimate token is a bucket ID in both solvable and stuck traces
+    → the model must actually read the trace.
+    """
+    remaining = MAX_SEQ_LEN_V2 - len(tokens) - 2  # room for END_V2 + CLS_V2
+    if remaining <= 0:
+        return
+    n = min((abs(state_hash) % max_n) + 1, remaining)
+    for i in range(n):
+        tokens.append(bucket_base + (abs(hash((state_hash, i))) % N_BUCKETS))
+
+
 def pad_trace_v2(toks: list[int], maxlen: int) -> list[int]:
     """Left-pad with PAD_V2, append CLS_V2 sentinel at end."""
     toks = toks + [CLS_V2]
@@ -76,15 +104,11 @@ def generate_ski_trace_v2(term: "Term") -> tuple[list[int], int]:
     """
     v2 encoding: raw SKI state bucket IDs, no REVISIT token.
 
-    Each reduction step emits a bucket ID (0-31) derived from the term hash.
-    Cycle detection is NOT done by the engine — the model must detect repeated
-    bucket IDs itself. The engine only terminates early when it detects a cycle
-    to bound trace length; it does NOT emit a special cycle token.
-
-    Solvable: [...bucket_ids..., COLLAPSE_V2, END_V2]
+    Solvable: [...bucket_ids..., COLLAPSE_V2, ...result_tail..., END_V2]
     Stuck:    [...bucket_ids..., END_V2]  (cycling or budget exhausted)
 
-    END_V2 is always the last token. The model cannot classify by last-token alone.
+    Result tail (1-5 bucket IDs) after COLLAPSE prevents positional shortcut.
+    END_V2 is always the last token.
     """
     tokens: list[int] = []
     seen_hashes: set[int] = set()
@@ -102,15 +126,15 @@ def generate_ski_trace_v2(term: "Term") -> tuple[list[int], int]:
 
         n_redex = count_redexes(t)
         if n_redex == 0:
+            h = term_hash(t)
             tokens.append(COLLAPSE_V2)
+            emit_result_tail(tokens, SKI_BUCKET_BASE, h)
             tokens.append(END_V2)
             return tokens, LABEL_SOLVABLE
 
         h = term_hash(t)
         tokens.append(ski_bucket(h))
 
-        # Cycle detected: terminate without emitting REVISIT.
-        # Model must infer stuck from seeing this bucket ID earlier in the trace.
         if h in seen_hashes:
             tokens.append(END_V2)
             return tokens, LABEL_STUCK
@@ -119,6 +143,7 @@ def generate_ski_trace_v2(term: "Term") -> tuple[list[int], int]:
         new_t = reduce_one_step(t)
         if new_t is None:
             tokens.append(COLLAPSE_V2)
+            emit_result_tail(tokens, SKI_BUCKET_BASE, h)
             tokens.append(END_V2)
             return tokens, LABEL_SOLVABLE
         t = new_t

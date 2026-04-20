@@ -30,6 +30,7 @@ from godel_rwkv.ski import (
     MAX_SEQ_LEN_V2,
     MAX_STEPS_V2,
     pad_trace_v2,
+    emit_result_tail,
 )
 
 
@@ -160,7 +161,9 @@ def generate_lambda_trace_v2(term: LTerm) -> tuple[list[int], int]:
 
         n_redex = count_beta_redexes(t)  # type: ignore[arg-type]
         if n_redex == 0:
+            h = lterm_hash(t)  # type: ignore[arg-type]
             tokens.append(COLLAPSE_V2)
+            emit_result_tail(tokens, LAM_BUCKET_BASE, h)
             tokens.append(END_V2)
             return tokens, LABEL_SOLVABLE
 
@@ -175,6 +178,7 @@ def generate_lambda_trace_v2(term: LTerm) -> tuple[list[int], int]:
         new_t = beta_step(t)  # type: ignore[arg-type]
         if new_t is None:
             tokens.append(COLLAPSE_V2)
+            emit_result_tail(tokens, LAM_BUCKET_BASE, h)
             tokens.append(END_V2)
             return tokens, LABEL_SOLVABLE
         t = new_t

@@ -26,6 +26,7 @@ from godel_rwkv.ski import (
     END_V2,
     MAX_SEQ_LEN_V2,
     pad_trace_v2,
+    emit_result_tail,
 )
 
 _MAX_TAPE = 50  # tape beyond this → BACK (divergence by growth)
@@ -169,6 +170,7 @@ def generate_tm_trace_v2(table: TMTable, initial: TMConfig) -> tuple[list[int], 
         next_cfg = run_one_tm_step(table, cfg)
         if next_cfg is None:
             tokens.append(COLLAPSE_V2)
+            emit_result_tail(tokens, TM_BUCKET_BASE, hash(cfg))
             tokens.append(END_V2)
             return tokens, LABEL_SOLVABLE
 
@@ -307,6 +309,7 @@ def generate_collatz_trace_v2(n: int, budget: int = 500) -> tuple[list[int], int
     if value == 1:
         # Reached fixed point — halted
         tokens.append(COLLAPSE_V2)
+        emit_result_tail(tokens, TM_BUCKET_BASE, hash((n, step)))
         tokens.append(END_V2)
         return tokens, LABEL_SOLVABLE, step
     else:

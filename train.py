@@ -167,11 +167,11 @@ def run_curriculum_v2() -> None:
     OUT_DIR.mkdir(exist_ok=True)
     LOG_PATH_V2.write_text("")
 
-    model = GodelRWKV(vocab_size=VOCAB_SIZE_V2, d_model=D_MODEL_V2, n_layers=N_LAYERS, n_heads=N_HEADS)
+    model = GodelRWKV(vocab_size=VOCAB_SIZE_V2, d_model=D_MODEL, n_layers=N_LAYERS, n_heads=N_HEADS)
     n_params = model.count_params()
 
     log("=== v2 CURRICULUM TRAINING ===", LOG_PATH_V2)
-    log(f"GodelRWKV v2 | params: {n_params:,} | d={D_MODEL_V2} L={N_LAYERS} H={N_HEADS}", LOG_PATH_V2)
+    log(f"GodelRWKV v2 | params: {n_params:,} | d={D_MODEL} L={N_LAYERS} H={N_HEADS}", LOG_PATH_V2)
     log(f"vocab_size={VOCAB_SIZE_V2} seq_len={MAX_SEQ_LEN_V2}", LOG_PATH_V2)
     log("Encoding: SKI buckets 0-31, Lambda 32-63, TM 64-95 (zero-shot), COLLAPSE=96, END=97", LOG_PATH_V2)
 
@@ -209,9 +209,10 @@ def run_curriculum_v2() -> None:
 
     # ---- Baseline comparison ----
     log("\n=== BASELINE COMPARISON ===", LOG_PATH_V2)
-    log(f"  LastTokenClassifier TM acc:       {battery.get('baseline_last_token_tm', 0):.4f}  (expect ~0.5)", LOG_PATH_V2)
-    log(f"  ContainsCollapseClassifier TM acc:{battery.get('baseline_contains_collapse_tm', 0):.4f}  (upper bound)", LOG_PATH_V2)
-    log(f"  GodelRWKV v2 TM zero-shot acc:    {battery.get('tm_zeroshot', 0):.4f}", LOG_PATH_V2)
+    log(f"  LastTokenClassifier TM acc:            {battery.get('baseline_last_token_tm', 0):.4f}  (expect ~0.5)", LOG_PATH_V2)
+    log(f"  PenultimateTokenClassifier TM acc:     {battery.get('baseline_penultimate_token_tm', 0):.4f}  (expect ~0.5 with result tail)", LOG_PATH_V2)
+    log(f"  ContainsCollapseClassifier TM acc:     {battery.get('baseline_contains_collapse_tm', 0):.4f}  (upper bound)", LOG_PATH_V2)
+    log(f"  GodelRWKV v2 TM zero-shot acc:         {battery.get('tm_zeroshot', 0):.4f}", LOG_PATH_V2)
 
     # ---- Save results ----
     (OUT_DIR / "history_v2.json").write_text(
@@ -237,19 +238,12 @@ def _write_results_v2(
 
     RESULTS_PATH_V2.write_text(f"""# GodelRWKV v2 Results
 
-## What changed from v1
-
-| v1 (broken) | v2 (fixed) |
-|---|---|
-| REVISIT token emitted by engine | No REVISIT — model detects cycles from repeated bucket IDs |
-| Unified 5-token alphabet (SKI=lambda=TM) | System-specific ranges: SKI 0-31, Lambda 32-63, TM 64-95 |
-| Last token = verdict (COLLAPSE/REVISIT/BACK) | END always last — last-token classification impossible |
-| "Zero-shot" was token-identity transfer | Zero-shot uses token range never seen in training |
-
 ## Model
-- Architecture: RWKV-7, d={D_MODEL_V2}, layers={N_LAYERS}, heads={N_HEADS}
+- Architecture: RWKV-7, d={D_MODEL}, layers={N_LAYERS}, heads={N_HEADS}
 - Params: {n_params:,}
 - Vocab: {VOCAB_SIZE_V2} tokens, seq_len={MAX_SEQ_LEN_V2}
+- Encoding: system-specific bucket ranges (SKI 0-31, Lambda 32-63, TM 64-95)
+- Result tail: 1-5 bucket IDs after COLLAPSE_V2 prevent positional shortcuts
 
 ## Stage Results
 
@@ -261,35 +255,36 @@ def _write_results_v2(
 
 | Test | Acc | Notes |
 |---|---|---|
-| collapse_detection | {battery.get('collapse_detection', 0):.4f} | COLLAPSE_V2 anywhere → SOLVABLE |
+| collapse_detection | {battery.get('collapse_detection', 0):.4f} | COLLAPSE_V2 at arbitrary position → SOLVABLE |
 | no_collapse_stuck | {battery.get('no_collapse_stuck', 0):.4f} | No COLLAPSE_V2 → STUCK |
-| cycle_detection | {battery.get('cycle_detection', 0):.4f} | Repeated bucket IDs → STUCK (model does cycle detection) |
+| cycle_detection | {battery.get('cycle_detection', 0):.4f} | Repeated bucket IDs → STUCK |
 | long_solvable | {battery.get('long_solvable', 0):.4f} | 25+ buckets then COLLAPSE → still SOLVABLE |
-| collapse_ablation_drop | {battery.get('collapse_ablation_drop', 0):+.4f} | Replace COLLAPSE → prediction flips |
+| collapse_ablation_drop | {battery.get('collapse_ablation_drop', 0):+.4f} | Replace COLLAPSE → prediction flips (expect > 0.5) |
 | lambda_crossbucket (32-63) | {battery.get('lambda_crossbucket', 0):.4f} | In training |
-| **tm_zeroshot (64-95)** | **{battery.get('tm_zeroshot', 0):.4f}** | **NEVER seen in training** |
+| tm_zeroshot (64-95) | {battery.get('tm_zeroshot', 0):.4f} | NEVER seen in training |
 | self_referential | {battery.get('self_referential_acc', 0):.4f} | Diagonal machine T0..T5 |
 
 ## Baseline Comparison
 
 | Classifier | TM acc | What it proves |
 |---|---|---|
-| LastTokenClassifier | {battery.get('baseline_last_token_tm', 0):.4f} | ~0.5 → v1's last-token tautology is gone |
+| LastTokenClassifier | {battery.get('baseline_last_token_tm', 0):.4f} | ~0.5 → last-token shortcut gone |
+| PenultimateTokenClassifier | {battery.get('baseline_penultimate_token_tm', 0):.4f} | ~0.5 → positional shortcut gone (result tail works) |
 | ContainsCollapseClassifier | {battery.get('baseline_contains_collapse_tm', 0):.4f} | Upper bound (simple scan) |
-| **GodelRWKV v2** | **{battery.get('tm_zeroshot', 0):.4f}** | Structural generalisation |
+| **GodelRWKV v2** | **{battery.get('tm_zeroshot', 0):.4f}** | Model vs baselines |
 
-## Self-Referential Diagonal Test
+## Diagonal TM Test
 
-D halts iff COLLAPSE_V2 is NOT in its input. The sequence T0=D(blank), T1=D(T0), ...
-oscillates SOLVABLE/STUCK/SOLVABLE/... for all finite n.
+D halts iff COLLAPSE_V2 is NOT in its input tape. Fed the trace of its own prior run,
+the output alternates SOLVABLE/STUCK. The model classifies each correctly.
 
 | i | True | Model | Correct | Trace len |
 |---|---|---|---|---|
 {sr_rows}
 
-The undecidable fixed point — D applied to its own description — lives at the limit
-of this sequence. Each finite approximation is decidable and the model handles it.
-The limit is where Penrose's argument actually lives.
+This is not a self-referential fixed-point iteration in the Gödel sense — D is a TM
+that checks for a specific token, and the model applies its learned classification
+rule to each fresh input. The alternation is a real property of the construction.
 """)
     print(f"\nv2 Results written to {RESULTS_PATH_V2}")
 

@@ -119,7 +119,7 @@
   ],
   "zfc_consistency": {
     "model": "STUCK",
-    "interpretation": "asserts consistency"
+    "note": "synthetic \u2014 trivially STUCK"
   },
   "5n1": [
     {

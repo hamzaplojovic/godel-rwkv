@@ -29,11 +29,15 @@ from godel_rwkv.ski import (
     S_COMBINATOR,
     SKI_BUCKET_BASE,
     LAM_BUCKET_BASE,
+    TM_BUCKET_BASE,
     N_BUCKETS,
     COLLAPSE_V2,
     END_V2,
+    PAD_V2,
+    CLS_V2,
     VOCAB_SIZE_V2,
     generate_ski_trace_v2,
+    emit_result_tail,
     omega,
     pad_trace_v2,
     ski_bucket,
@@ -135,14 +139,24 @@ def compute_accuracy(logits: mx.array, labels: list[int]) -> float:
 _V2_MAX_SYNTH_LEN = 60
 
 
+_ALL_BUCKET_BASES = [SKI_BUCKET_BASE, LAM_BUCKET_BASE, TM_BUCKET_BASE]
+
+
+def _random_bucket_base() -> int:
+    """Random bucket base from all three ranges — ensures model sees all token IDs."""
+    return random.choice(_ALL_BUCKET_BASES)
+
+
 def _make_v2_stuck_synthetic(min_len: int = 6, max_len: int = _V2_MAX_SYNTH_LEN) -> list[int]:
     """
     Synthetic stuck trace for v2: bucket IDs with a cycle (repeated ID).
     The cycle makes it stuck; there is no COLLAPSE_V2.
+    Bucket base randomly chosen from all three ranges (0, 32, 64).
     """
+    bucket_base = _random_bucket_base()
     length = random.randint(min_len, max_len)
     cycle_period = random.randint(2, max(2, min(6, length // 2)))
-    base = [random.randint(SKI_BUCKET_BASE, SKI_BUCKET_BASE + N_BUCKETS - 1)
+    base = [random.randint(bucket_base, bucket_base + N_BUCKETS - 1)
             for _ in range(cycle_period)]
     toks: list[int] = []
     for i in range(length):
@@ -155,9 +169,11 @@ def _make_v2_stuck_budget(min_len: int = 20, max_len: int = _V2_MAX_SYNTH_LEN) -
     """
     Synthetic stuck trace for v2: all distinct bucket IDs, no COLLAPSE_V2.
     Mimics budget-exhausted non-termination (term grew but never cycled visibly).
+    Bucket base randomly chosen from all three ranges.
     """
+    bucket_base = _random_bucket_base()
     length = random.randint(min_len, max_len)
-    toks = [random.randint(SKI_BUCKET_BASE, SKI_BUCKET_BASE + N_BUCKETS - 1)
+    toks = [random.randint(bucket_base, bucket_base + N_BUCKETS - 1)
             for _ in range(length)]
     toks.append(END_V2)
     return toks
@@ -165,13 +181,17 @@ def _make_v2_stuck_budget(min_len: int = 20, max_len: int = _V2_MAX_SYNTH_LEN) -
 
 def _make_v2_solvable_synthetic(min_len: int = 1, max_len: int = _V2_MAX_SYNTH_LEN) -> list[int]:
     """
-    Synthetic solvable trace: bucket IDs ending with COLLAPSE_V2 + END_V2.
-    No repeated bucket IDs (simulates a reducing computation that terminates).
+    Synthetic solvable trace: bucket IDs, then COLLAPSE_V2, then result tail, then END_V2.
+    Result tail (1-5 bucket IDs) prevents penultimate-position shortcut.
+    Bucket base randomly chosen from all three ranges.
     """
+    bucket_base = _random_bucket_base()
     length = random.randint(min_len, max_len)
-    toks = [random.randint(SKI_BUCKET_BASE, SKI_BUCKET_BASE + N_BUCKETS - 1)
+    toks = [random.randint(bucket_base, bucket_base + N_BUCKETS - 1)
             for _ in range(length)]
     toks.append(COLLAPSE_V2)
+    state_hash = hash(tuple(toks))
+    emit_result_tail(toks, bucket_base, state_hash)
     toks.append(END_V2)
     return toks
 
@@ -320,14 +340,27 @@ class LastTokenClassifier:
     Checks if last real token (position -2, before CLS) equals COLLAPSE_V2.
     In v2 encoding: last real token is always END_V2 (never COLLAPSE_V2).
     → Predicts STUCK for every input → ~50% accuracy → proves last-token tautology is gone.
-    In v1 encoding: last real token WAS COLLAPSE/REVISIT/BACK → near 100% accuracy.
     """
     def __call__(self, x: mx.array) -> mx.array:
-        # x: (B, T). Last real token is at position -2 (before CLS_V2 sentinel).
         last_real = x[:, -2]  # (B,)
         is_collapse = (last_real == COLLAPSE_V2).astype(mx.float32)
-        # is_collapse=1 → predict SOLVABLE (logit < 0); 0 → STUCK (logit > 0)
-        return 5.0 * (1.0 - 2.0 * is_collapse)  # +5 if not collapse, -5 if collapse
+        return 5.0 * (1.0 - 2.0 * is_collapse)
+
+
+class PenultimateTokenClassifier:
+    """
+    Checks if the penultimate real token (position -3, before END_V2 + CLS_V2)
+    equals COLLAPSE_V2. This is the shortcut that catches a model which only
+    learned COLLAPSE_V2's position rather than scanning the full trace.
+
+    Without result tail: scores ~100% (COLLAPSE always at -3) → model is trivial.
+    With result tail: scores ~50% (penultimate is a bucket ID in both classes)
+    → proves the positional shortcut is broken.
+    """
+    def __call__(self, x: mx.array) -> mx.array:
+        penultimate = x[:, -3]  # (B,) — position before END_V2, CLS_V2
+        is_collapse = (penultimate == COLLAPSE_V2).astype(mx.float32)
+        return 5.0 * (1.0 - 2.0 * is_collapse)
 
 
 class ContainsCollapseClassifier:
@@ -453,7 +486,11 @@ def run_evaluation_battery_v2(model: object) -> dict[str, float]:
     results["self_referential_acc"] = sr_acc
 
     # Baseline comparisons
-    for name, clf in [("last_token", LastTokenClassifier()), ("contains_collapse", ContainsCollapseClassifier())]:
+    for name, clf in [
+        ("last_token", LastTokenClassifier()),
+        ("penultimate_token", PenultimateTokenClassifier()),
+        ("contains_collapse", ContainsCollapseClassifier()),
+    ]:
         tm_bl = mx.concatenate(
             [clf(tm_data["seqs"][i:i+chunk]) for i in range(0, tm_data["seqs"].shape[0], chunk)],
             axis=0,
@@ -518,8 +555,9 @@ def print_evaluation_battery_v2(results: dict[str, float], sr_results: list[dict
     print(f"  lambda_crossbucket (32-63):  {results.get('lambda_crossbucket', 0):.4f}  (in training)")
     print(f"  tm_zeroshot (64-95):         {results.get('tm_zeroshot', 0):.4f}  (NEVER seen in training)")
     print(f"  self_referential:            {results.get('self_referential_acc', 0):.4f}")
-    print(f"  baseline_last_token_tm:      {results.get('baseline_last_token_tm', 0):.4f}  (should be ~0.5 — proves last-token tautology gone)")
-    print(f"  baseline_contains_collapse:  {results.get('baseline_contains_collapse_tm', 0):.4f}  (upper bound)")
+    print(f"  baseline_last_token_tm:      {results.get('baseline_last_token_tm', 0):.4f}  (should be ~0.5 — last-token tautology gone)")
+    print(f"  baseline_penultimate_tm:     {results.get('baseline_penultimate_token_tm', 0):.4f}  (should be ~0.5 — positional shortcut gone)")
+    print(f"  baseline_contains_collapse:  {results.get('baseline_contains_collapse_tm', 0):.4f}  (upper bound — simple scan)")
 
     print("\n=== SELF-REFERENTIAL DIAGONAL TEST ===")
     print("  D halts iff COLLAPSE_V2 NOT in its input. Fed its own prior trace:")

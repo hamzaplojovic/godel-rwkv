@@ -22,7 +22,7 @@ import mlx.core as mx
 import numpy as np
 
 from godel_rwkv.ski import (
-    VOCAB_SIZE_V2, MAX_SEQ_LEN_V2, pad_trace_v2,
+    VOCAB_SIZE_V2, MAX_SEQ_LEN_V2, pad_trace_v2, emit_result_tail,
     COLLAPSE_V2, END_V2, TM_BUCKET_BASE, N_BUCKETS,
     LABEL_SOLVABLE, LABEL_STUCK,
 )
@@ -78,6 +78,7 @@ def run_generic_sequence(
         next_state = step_fn(state, step)
         if next_state is None:
             tokens.append(COLLAPSE_V2)
+            emit_result_tail(tokens, TM_BUCKET_BASE, hash((state, step)))
             tokens.append(END_V2)
             return tokens, "SOLVABLE"
 
@@ -320,6 +321,7 @@ def generate_hydra_trace(initial_tree: HydraTree, budget: int = BUDGET) -> tuple
         next_tree = hydra_step(tree, step)
         if next_tree is None:
             tokens.append(COLLAPSE_V2)
+            emit_result_tail(tokens, TM_BUCKET_BASE, hash(repr(tree)))
             tokens.append(END_V2)
             return tokens, "SOLVABLE (Hercules won)", step
 
@@ -401,25 +403,26 @@ def generate_tree_trace(k: int, budget: int = BUDGET) -> tuple[list[int], str, i
     True answer for all k: SOLVABLE (TREE is well-defined and finite for each k).
     """
     if k not in TREE_VALUES:
-        # TREE(k) for k≥3: budget exceeded, known finite but incomputably large
+        # TREE(k) for k≥3: value is finite but incomputably large.
+        # We emit a synthetic budget-exceeded trace. The model predicts STUCK
+        # trivially — no COLLAPSE by construction. This is NOT a real computation
+        # of TREE(k); it is a placeholder showing what budget-exhaustion looks like.
         tokens: list[int] = []
         for step in range(budget):
             if len(tokens) >= MAX_SEQ_LEN_V2 - 2:
                 break
             tokens.append(tm_bucket(hash(("TREE", k, step))))
         tokens.append(END_V2)
-        return tokens, "STUCK (budget)", budget
+        return tokens, "STUCK (synthetic — TREE(k) too large to compute)", budget
 
     target = TREE_VALUES[k]
     tokens = []
     for step in range(target):
         tokens.append(tm_bucket(hash(("TREE", k, step))))
-        if step == target - 1:
-            tokens.append(COLLAPSE_V2)
-            tokens.append(END_V2)
-            return tokens, "SOLVABLE (TREE completed)", target
+    tokens.append(COLLAPSE_V2)
+    emit_result_tail(tokens, TM_BUCKET_BASE, hash(("TREE", k)))
     tokens.append(END_V2)
-    return tokens, "STUCK", target
+    return tokens, "SOLVABLE", target
 
 
 # ===========================================================================
@@ -427,40 +430,28 @@ def generate_tree_trace(k: int, budget: int = BUDGET) -> tuple[list[int], str, i
 # ===========================================================================
 # A TM C that enumerates proofs in a formal system and halts if it finds ⊥.
 # C halts iff the formal system is inconsistent.
-# Model predicts STUCK → asserts the system is consistent.
-# By Gödel's 2nd incompleteness theorem, the formal system cannot prove this.
-# The model's prediction IS the assertion of consistency.
+#
+# NOTE: This is a synthetic placeholder trace, not an actual proof enumerator.
+# We emit 74 unique bucket IDs with no COLLAPSE. The model predicts STUCK
+# trivially — there is no COLLAPSE token to find. This does NOT constitute
+# the model "asserting consistency" in any meaningful sense.
 
 def generate_zfc_consistency_trace(budget: int = BUDGET) -> tuple[list[int], str]:
     """
-    Simulates C_F: searches for a proof of ⊥ in a formal system.
+    Synthetic trace representing a consistency-checking TM.
 
-    We implement a simplified proof enumerator over propositional logic
-    (which IS consistent — no contradiction derivable from tautologies).
-    The TM generates all possible proof attempts in order of length,
-    checking each against the axioms. Since the system is consistent,
-    it never halts.
-
-    The model's STUCK prediction = "I assert this system is consistent."
-    This assertion mirrors what Gödel showed no formal system can prove
-    about itself — yet the model makes it effortlessly.
-
-    We use a simple enumeration: step n = checking proof attempt n.
-    Each step is unique (step number included in hash). No cycles.
-    Budget exceeded → STUCK (consistent).
+    A real implementation would enumerate proofs and check for contradictions.
+    We emit a budget-length sequence of unique bucket IDs with no COLLAPSE.
+    The model's STUCK prediction is trivially correct (no COLLAPSE by construction).
     """
     tokens = []
-    # Simulate proof enumeration: each step attempts proof #step
-    # In a consistent system, this never finds a contradiction.
     for step in range(budget):
         if len(tokens) >= MAX_SEQ_LEN_V2 - 2:
             break
-        # Each proof attempt is a unique config
         tokens.append(tm_bucket(hash(("C_F_proof_attempt", step))))
-        # We never find ⊥ (system is consistent), so never COLLAPSE
 
     tokens.append(END_V2)
-    return tokens, "STUCK (consistent — no proof of ⊥ found)"
+    return tokens, "STUCK (synthetic — no COLLAPSE by construction)"
 
 
 # ===========================================================================
@@ -503,6 +494,7 @@ def generate_5n1_trace(n: int, budget: int = BUDGET) -> tuple[list[int], str, in
 
     if value == 1:
         tokens.append(COLLAPSE_V2)
+        emit_result_tail(tokens, TM_BUCKET_BASE, hash((n, step)))
         tokens.append(END_V2)
         return tokens, "SOLVABLE", step
     else:
@@ -595,17 +587,15 @@ def run_frontier() -> None:
     all_results["ordinal_hierarchy"] = ordinal_results
 
     # ------------------------------------------------------------------
-    section("3. ZFC CONSISTENCY — Gödel's 2nd Incompleteness Theorem")
-    print("  Model's STUCK prediction = assertion of consistency.")
-    print("  By Gödel's 2nd theorem, no formal system can prove its own consistency.\n")
+    section("3. ZFC CONSISTENCY — synthetic placeholder")
+    print("  Synthetic trace with no COLLAPSE. Model predicts STUCK trivially.\n")
 
     toks, outcome = generate_zfc_consistency_trace()
     pred = predict(model, toks)
     print(f"  Consistency TM C_F:  model={pred}")
-    print(f"  Interpretation: the model asserts 'the formal system is consistent'")
-    print(f"  This assertion cannot be verified within any sufficiently strong formal system.")
-    print(f"  The model makes it anyway — the same leap Gödel showed is unprovable.")
-    all_results["zfc_consistency"] = {"model": pred, "interpretation": "asserts consistency"}
+    print(f"  Note: this is a synthetic trace (74 unique bucket IDs, no COLLAPSE).")
+    print(f"  The STUCK prediction is trivially correct — not a meaningful assertion.")
+    all_results["zfc_consistency"] = {"model": pred, "note": "synthetic — trivially STUCK"}
 
     # ------------------------------------------------------------------
     section("4. 5n+1 PROBLEM — open problem with known diverging cases")
@@ -634,30 +624,33 @@ def run_frontier() -> None:
     section("5. FRONTIER SUMMARY")
 
     print("""
-  Mathematical frontier breakdown:
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │ Boundary              │ Formal system exceeded │ Model status        │
-  ├─────────────────────────────────────────────────────────────────────┤
-  │ Primitive recursive   │ (none)                 │ ✓ handles           │
-  │ Ackermann A(3,n)      │ PR (Mints 1994)        │ ✓/✗ depends on n   │
-  │ Goodstein G(n)        │ PA (Kirby-Paris 1982)  │ ✓ n≤3, ✗ n≥4       │
-  │ Kirby-Paris Hydra     │ PA (same ε₀ level)     │ ✓ depth≤2, ✗ ≥3   │
-  │ BB(5) = 47M steps     │ (computable but slow)  │ ✗ GAP              │
-  │ TREE(3)               │ beyond ZFC             │ ✗ GAP              │
-  │ ZFC consistency       │ ZFC (Gödel 1931)       │ asserts STUCK      │
-  │ BB(6) = >10^18267     │ ZFC-independent likely │ ✗ GAP              │
-  └─────────────────────────────────────────────────────────────────────┘
+  Results breakdown:
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │ Case                  │ Fits in budget? │ Model prediction │ Correct?   │
+  ├──────────────────────────────────────────────────────────────────────────┤
+  │ BB(2), BB(3)          │ Yes             │ SOLVABLE         │ ✓          │
+  │ BB(4) — 107 steps     │ No              │ STUCK            │ ✗ (budget) │
+  │ BB(5) — 47M steps     │ No              │ STUCK            │ ✗ (budget) │
+  │ BB(5) non-halting     │ N/A             │ STUCK            │ ✓          │
+  │ BB(6) — >10^18267     │ No              │ STUCK            │ ✗ (budget) │
+  │ Ackermann(3,5+)       │ No              │ STUCK            │ ✗ (budget) │
+  │ Hydra depth 1-3       │ Yes             │ SOLVABLE         │ ✓          │
+  │ Hydra depth 4         │ No              │ STUCK            │ ✗ (budget) │
+  │ TREE(1), TREE(2)      │ Yes             │ SOLVABLE         │ ✓          │
+  │ TREE(3-4) (synthetic) │ N/A             │ STUCK            │ trivially  │
+  │ ZFC cons. (synthetic) │ N/A             │ STUCK            │ trivially  │
+  │ 5n+1 terminators      │ Yes             │ SOLVABLE         │ ✓          │
+  │ 5n+1 divergers        │ N/A             │ STUCK            │ ✓          │
+  └──────────────────────────────────────────────────────────────────────────┘
 
-  "✓ handles" = model sees COLLAPSE, correctly predicts SOLVABLE
-  "✗ GAP"     = budget exceeded, model predicts STUCK, true answer SOLVABLE
-  "asserts X" = model's prediction is mathematically meaningful beyond provability
+  "✓"         = model correctly classifies by detecting COLLAPSE (or its absence)
+  "✗ (budget)" = computation exceeds 74-step budget; model correctly reports no
+                 COLLAPSE seen, but the true computation would eventually halt
+  "trivially"  = synthetic trace with no COLLAPSE by construction; STUCK is trivial
 
-  The model's 74-step observation window places it between:
-    - PA (can prove everything ε₀ and below, within budget)
-    - ZFC (can prove Goodstein, hydra, but not its own consistency)
-
-  Every ✗ GAP is a mathematical record: a boundary the model encounters but
-  cannot cross, corresponding to a specific formal system's incompleteness limit.
+  The ✗ (budget) cases are NOT proof-theoretic boundaries. Changing the budget
+  parameter moves where they fall. BB(4) at 107 steps would become ✓ with
+  budget ≥ 108. The boundary is a simulation parameter, not an ordinal.
 """)
 
     (OUT_DIR / "frontier.json").write_text(json.dumps(all_results, indent=2))

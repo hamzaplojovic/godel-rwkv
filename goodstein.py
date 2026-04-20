@@ -47,7 +47,7 @@ import mlx.core as mx
 import numpy as np
 
 from godel_rwkv.ski import (
-    VOCAB_SIZE_V2, MAX_SEQ_LEN_V2, pad_trace_v2,
+    VOCAB_SIZE_V2, MAX_SEQ_LEN_V2, pad_trace_v2, emit_result_tail,
     COLLAPSE_V2, END_V2, TM_BUCKET_BASE, N_BUCKETS, LABEL_SOLVABLE, LABEL_STUCK,
 )
 from godel_rwkv.curriculum import LastTokenClassifier, ContainsCollapseClassifier
@@ -156,6 +156,7 @@ def generate_goodstein_trace_v2(n: int, budget: int = 74) -> tuple[list[int], in
 
     if value == 0:
         tokens.append(COLLAPSE_V2)
+        emit_result_tail(tokens, TM_BUCKET_BASE, hash((n, step)))
         tokens.append(END_V2)
         return tokens, LABEL_SOLVABLE, step
     else:

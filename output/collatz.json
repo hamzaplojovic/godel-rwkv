@@ -6,7 +6,7 @@
     "n_examples": 99
   },
   "hard": {
-    "model_acc": 0.99,
+    "model_acc": 0.995,
     "last_token_acc": 0.38,
     "contains_collapse_acc": 1.0,
     "n_examples": 200
