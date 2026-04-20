@@ -24,16 +24,16 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 
-from godel_rwkv.ski import VOCAB_SIZE_V2, MAX_SEQ_LEN_V2
 from godel_rwkv.curriculum import (
     build_stage1_v2,
     build_stage2_v2,
     build_stage3_v2,
-    run_evaluation_battery_v2,
     print_evaluation_battery_v2,
+    run_evaluation_battery_v2,
     run_self_referential_test,
 )
 from godel_rwkv.model import GodelRWKV, binary_cross_entropy_loss
+from godel_rwkv.ski import MAX_SEQ_LEN_V2, VOCAB_SIZE_V2
 
 # ---------------------------------------------------------------------------
 # Config
