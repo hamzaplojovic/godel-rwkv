@@ -170,6 +170,7 @@ main.py               — Entry point: train + evaluate
 collatz.py            — Collatz budget-boundary experiment
 goodstein.py          — Goodstein sequence experiment
 frontier.py           — BB machines, Hydra, Ackermann, TREE, 5n+1
+mine_sessions.py      — Session transcript miner (zero dependencies)
 
 output/
   model_v2_s3.npz        — Trained weights
