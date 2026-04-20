@@ -197,15 +197,15 @@ class RWKV7ChannelMix(nn.Module):
 class RWKV7Block(nn.Module):
     def __init__(self, d_model: int, n_heads: int, layer_id: int, n_layers: int):
         super().__init__()
-        self.layer_norm_before_time_mix = nn.LayerNorm(d_model)
-        self.layer_norm_before_channel_mix = nn.LayerNorm(d_model)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
         self.time_mix = RWKV7TimeMix(d_model, n_heads, layer_id, n_layers)
-        self.channel_mix = RWKV7ChannelMix(d_model, layer_id, n_layers)
+        self.chan_mix = RWKV7ChannelMix(d_model, layer_id, n_layers)
 
     def __call__(self, x, v_first=None, state=None):
-        time_mix_output, v_first, state = self.time_mix(self.layer_norm_before_time_mix(x), v_first, state)
+        time_mix_output, v_first, state = self.time_mix(self.ln1(x), v_first, state)
         x = x + time_mix_output
-        x = x + self.channel_mix(self.layer_norm_before_channel_mix(x))
+        x = x + self.chan_mix(self.ln2(x))
         return x, v_first, state
 
 
@@ -217,23 +217,23 @@ class GodelRWKV(nn.Module):
         super().__init__()
         self.n_classes = n_classes
 
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.input_layer_norm = nn.LayerNorm(d_model)
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.ln_in = nn.LayerNorm(d_model)
         self.blocks = [RWKV7Block(d_model, n_heads, i, n_layers) for i in range(n_layers)]
-        self.output_layer_norm = nn.LayerNorm(d_model)
-        self.classification_head = nn.Linear(d_model, n_classes, bias=True)
+        self.ln_out = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, n_classes, bias=True)
 
     def __call__(self, token_ids: mx.array) -> mx.array:
         # token_ids: (batch, sequence_length) integer token IDs
-        hidden = self.input_layer_norm(self.embedding(token_ids))
+        hidden = self.ln_in(self.embed(token_ids))
 
         v_first = None
         for block in self.blocks:
             hidden, v_first, _ = block(hidden, v_first, None)
 
         # Use last token's hidden state (has seen full sequence via recurrence)
-        last_token_hidden = self.output_layer_norm(hidden[:, -1, :])
-        logits = self.classification_head(last_token_hidden)
+        last_token_hidden = self.ln_out(hidden[:, -1, :])
+        logits = self.head(last_token_hidden)
 
         if self.n_classes == 1:
             return logits.squeeze(-1)
