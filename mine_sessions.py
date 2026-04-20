@@ -1,169 +1,138 @@
+#!/usr/bin/env python3
 """
 mine_sessions.py — Extract agent traces from Claude Code session transcripts.
 
-Reads .jsonl session files from ~/.claude/projects/ and converts each session's
-tool-call sequence into a labeled trace suitable for training GodelRWKV.
+Zero dependencies — runs with system python3, no install needed.
 
-Each tool call is hashed to a bucket ID (integer 64-95). The output contains
-NO code, NO file contents, NO conversation text, NO prompts, NO API keys —
-just sequences of numbers plus metadata (project name, tool names, outcome label).
-
-Privacy: the script reads what tools were called and in what order, not what
-was in the files or what the user said. Output is safe to share.
-
-Labels are inferred from session outcomes:
-  SOLVED     — session ended with a successful action (commit, push, write, edit)
-  STUCK      — repeated (tool, file) pairs detected (3+ repeats of same action)
-  ABANDONED  — session ended mid-task (no resolution signal)
-
-Output: output/traces.jsonl — one JSON object per session.
+Reads .jsonl session files from ~/.claude/projects/ and extracts tool-call
+sequences as labeled traces. Output contains NO code, NO file contents,
+NO conversation text, NO API keys — just tool names, bucket ID sequences,
+and outcome labels. Safe to share.
 
 Usage:
-    uv run mine_sessions.py                          # mine all sessions
-    uv run mine_sessions.py ~/.claude/projects/      # explicit path
-    uv run mine_sessions.py --min-tools 5            # filter short sessions
-    uv run mine_sessions.py --verbose                # log every session processed
+    python3 mine_sessions.py                  # mine all sessions
+    python3 mine_sessions.py --verbose        # log every session
+    python3 mine_sessions.py --min-tools 10   # filter short sessions
 """
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
+import re
 import sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from godel_rwkv.ski import (
-    TM_BUCKET_BASE,
-    N_BUCKETS,
-    COLLAPSE_V2,
-    END_V2,
-    emit_result_tail,
-)
+# v2 encoding constants (hardcoded — no godel_rwkv dependency needed)
+TM_BUCKET_BASE = 64
+N_BUCKETS = 32
+COLLAPSE = 96
+END = 97
 
-OUT_PATH = Path("output/traces.jsonl")
+WORK_TOOLS = {"Read", "Edit", "Write", "Bash", "Grep", "Glob", "Agent"}
+SUCCESS_PATTERNS = ["git commit", "git push", "npm run", "pytest", "uv run"]
+CREDENTIAL_WORDS = [
+    "password", "pgpassword", "token", "secret", "api_key", "apikey",
+    "bearer", "credential", "auth_token", "access_key", "private_key",
+]
+SENSITIVE_FILES = [".env", ".secret", "credentials", "keyfile"]
 
-log = logging.getLogger("mine_sessions")
+OUT = Path("output/traces.jsonl")
+log = logging.getLogger("mine")
 
-# Tool calls that signal successful completion
-_SUCCESS_PATTERNS = ["git commit", "git push", "npm run", "pytest", "uv run"]
+# ---------------------------------------------------------------------------
+# Privacy
+# ---------------------------------------------------------------------------
 
-# Tool calls that signal the agent is working (not meta/system)
-_WORK_TOOLS = {"Read", "Edit", "Write", "Bash", "Grep", "Glob", "Agent"}
-
-
-def hash_tool_call(tool: str, target: str) -> int:
-    """Hash a (tool, target) pair to a TM bucket ID (64-95)."""
-    key = f"{tool}:{target}"
-    h = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16)
-    return TM_BUCKET_BASE + (h % N_BUCKETS)
+def scrub(text: str) -> str:
+    """Strip credentials and home paths from a string."""
+    for word in CREDENTIAL_WORDS:
+        text = re.sub(rf'(?i)({re.escape(word)})[=:]\S+', r'\1=<REDACTED>', text)
+    text = re.sub(r'/(?:Users|home)/[^/\s]+/?', '', text)
+    return text
 
 
-def extract_target(tool: str, args: dict) -> str:
-    """Extract the primary target from tool call args.
+def scrub_path(path: str) -> str:
+    """Strip home dir prefix, username patterns from a file path."""
+    path = re.sub(r'^/(?:Users|home)/[^/]+/', '', path)
+    return path
 
-    Returns a short string identifying what the tool operated on.
-    For file tools: the file path. For Bash: first two words of command.
-    For search tools: the pattern. No file contents are captured.
-    """
+
+def is_sensitive_file(path: str) -> bool:
+    return any(p in Path(path).name.lower() for p in SENSITIVE_FILES)
+
+# ---------------------------------------------------------------------------
+# Extraction
+# ---------------------------------------------------------------------------
+
+def target_of(tool: str, args: dict) -> str:
+    """Short string identifying what the tool operated on."""
     if tool in ("Read", "Write", "Edit"):
         return args.get("file_path", "")
     if tool == "Bash":
-        cmd = args.get("command", "")
-        parts = cmd.split()[:2]
-        return " ".join(parts)
-    if tool == "Grep":
-        return args.get("pattern", "")
-    if tool == "Glob":
+        return " ".join(args.get("command", "").split()[:2])
+    if tool in ("Grep", "Glob"):
         return args.get("pattern", "")
     return tool
 
 
-def extract_tool_calls(session_path: Path) -> list[dict]:
-    """Extract all tool calls from a session transcript.
-
-    Only reads tool name + args keys. Does NOT read tool results,
-    conversation text, or any file contents.
-    """
+def extract_calls(path: Path) -> list[dict]:
+    """Extract work tool calls from a session transcript."""
     calls = []
-    with open(session_path) as f:
+    with open(path) as f:
         for line in f:
             try:
                 msg = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
-
             if msg.get("type") != "assistant":
                 continue
-
-            content = msg.get("message", {}).get("content", [])
-            for block in content:
+            for block in msg.get("message", {}).get("content", []):
                 if block.get("type") != "tool_use":
                     continue
                 name = block.get("name", "")
-                if name not in _WORK_TOOLS:
+                if name not in WORK_TOOLS:
                     continue
-                args = block.get("input", {})
-                target = extract_target(name, args)
-                calls.append({
-                    "tool": name,
-                    "target": target,
-                    "key": f"{name}:{target}",
-                })
-
+                tgt = target_of(name, block.get("input", {}))
+                calls.append({"tool": name, "target": tgt, "key": f"{name}:{tgt}"})
     return calls
 
 
 def detect_outcome(calls: list[dict]) -> str:
-    """Infer session outcome from tool call pattern."""
+    """Infer session outcome. Checks STUCK before SOLVED to avoid mislabeling."""
     if len(calls) < 3:
         return "SHORT"
 
-    # Check for success: last few calls contain commit/push/test/write
-    last_calls = calls[-5:]
-    for call in last_calls:
-        if call["tool"] == "Bash":
-            for pattern in _SUCCESS_PATTERNS:
-                if pattern in call["target"]:
-                    return "SOLVED"
-        if call["tool"] == "Write":
-            return "SOLVED"
+    max_repeat = max(Counter(c["key"] for c in calls).values(), default=0)
 
-    # Check for stuck: repeated (tool, target) pairs
-    key_counts = Counter(c["key"] for c in calls)
-    max_repeat = max(key_counts.values()) if key_counts else 0
     if max_repeat >= 3:
         return "STUCK"
 
-    # Check for partial success: Edit calls present (work was done)
-    has_edits = any(c["tool"] == "Edit" for c in calls)
-    if has_edits:
+    for call in calls[-5:]:
+        if call["tool"] == "Bash" and any(p in call["target"] for p in SUCCESS_PATTERNS):
+            return "SOLVED"
+        if call["tool"] == "Write":
+            return "SOLVED"
+
+    if max_repeat >= 2:
+        return "STUCK"
+
+    if any(c["tool"] == "Edit" for c in calls):
         return "SOLVED"
 
     return "ABANDONED"
 
 
-def detect_stuck_pattern(calls: list[dict]) -> str | None:
-    """Classify the type of stuck pattern, if any.
-
-    Returns None if not stuck, or one of:
-      LOOP           — exact (tool, target) repeated 3+ times
-      EDIT_REVERT    — same file edited 3+ times (trying different fixes)
-      READ_CYCLE     — same file read 3+ times (re-reading without progress)
-      TEST_FAIL_LOOP — Bash test command repeated 3+ times
-    """
-    key_counts = Counter(c["key"] for c in calls)
-    if not key_counts:
+def stuck_pattern(calls: list[dict]) -> str | None:
+    """Classify stuck type: LOOP, EDIT_REVERT, READ_CYCLE, TEST_FAIL_LOOP."""
+    top_key, top_count = Counter(c["key"] for c in calls).most_common(1)[0]
+    if top_count < 2:
         return None
-
-    top_key, top_count = key_counts.most_common(1)[0]
-    if top_count < 3:
-        return None
-
-    tool, target = top_key.split(":", 1)
-
+    tool = top_key.split(":")[0]
+    target = top_key.split(":", 1)[1] if ":" in top_key else ""
     if tool == "Edit":
         return "EDIT_REVERT"
     if tool == "Read":
@@ -173,188 +142,135 @@ def detect_stuck_pattern(calls: list[dict]) -> str | None:
     return "LOOP"
 
 
-def extract_files_touched(calls: list[dict]) -> list[str]:
-    """Extract unique file paths from Read/Edit/Write calls."""
-    files = []
-    seen = set()
+def to_trace(calls: list[dict], outcome: str) -> list[int]:
+    """Convert tool calls to bucket ID sequence."""
+    tokens = []
     for call in calls:
-        if call["tool"] in ("Read", "Edit", "Write"):
-            path = call["target"]
-            if path and path not in seen:
-                files.append(path)
-                seen.add(path)
-    return files
-
-
-def calls_to_trace(calls: list[dict], outcome: str) -> list[int]:
-    """Convert tool calls to a v2-encoded trace."""
-    tokens: list[int] = []
-
-    for call in calls:
-        bucket = hash_tool_call(call["tool"], call["target"])
-        tokens.append(bucket)
+        h = int(hashlib.sha256(call["key"].encode()).hexdigest()[:8], 16)
+        tokens.append(TM_BUCKET_BASE + (h % N_BUCKETS))
 
     if outcome == "SOLVED":
-        tokens.append(COLLAPSE_V2)
-        if tokens:
-            emit_result_tail(tokens, TM_BUCKET_BASE, hash(tuple(tokens)))
-    tokens.append(END_V2)
+        tokens.append(COLLAPSE)
+        # Result tail: 1-5 bucket IDs after COLLAPSE (variable position)
+        tail_hash = hash(tuple(tokens))
+        n_tail = (abs(tail_hash) % 5) + 1
+        for i in range(n_tail):
+            tokens.append(TM_BUCKET_BASE + (abs(hash((tail_hash, i))) % N_BUCKETS))
 
+    tokens.append(END)
     return tokens
 
+# ---------------------------------------------------------------------------
+# Mining
+# ---------------------------------------------------------------------------
 
-def mine_session(session_path: Path) -> dict | None:
-    """Mine one session into a trace record."""
-    calls = extract_tool_calls(session_path)
+def mine(path: Path) -> dict | None:
+    calls = extract_calls(path)
     if len(calls) < 3:
-        log.debug("skip %s — only %d tool calls", session_path.name, len(calls))
         return None
 
     outcome = detect_outcome(calls)
-    trace = calls_to_trace(calls, outcome)
-    stuck_pattern = detect_stuck_pattern(calls) if outcome == "STUCK" else None
-    files_touched = extract_files_touched(calls)
+    pattern = stuck_pattern(calls) if outcome == "STUCK" else None
 
-    # Derive project name from path
-    project = session_path.parent.name
-    project = project.replace("-Users-hamzaplojovic-", "")
+    # Files touched (scrubbed, sensitive files excluded)
+    files = []
+    seen_files: set[str] = set()
+    for c in calls:
+        if c["tool"] in ("Read", "Edit", "Write") and c["target"] and c["target"] not in seen_files:
+            seen_files.add(c["target"])
+            if not is_sensitive_file(c["target"]):
+                files.append(scrub_path(c["target"]))
 
-    # Repeat analysis: which (tool, target) pairs repeated most
-    key_counts = Counter(c["key"] for c in calls)
-    top_repeats = [
-        {"key": k, "count": c}
-        for k, c in key_counts.most_common(5) if c >= 2
-    ]
+    # Top repeats (scrubbed)
+    repeats = []
+    for key, count in Counter(c["key"] for c in calls).most_common(5):
+        if count < 2:
+            break
+        repeats.append({"key": scrub(scrub_path(key)), "count": count})
 
-    # Tool usage distribution
-    tool_counts = Counter(c["tool"] for c in calls)
+    project = path.parent.name.replace("-Users-hamzaplojovic-", "")
+    date = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
 
-    # Session timestamp from file mtime
-    mtime = session_path.stat().st_mtime
-    session_date = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
-
-    record = {
-        "session_id": session_path.stem,
+    return {
+        "session_id": path.stem,
         "project": project,
-        "date": session_date,
+        "date": date,
         "n_tool_calls": len(calls),
         "outcome": outcome,
-        "stuck_pattern": stuck_pattern,
-        "trace": trace,
-        "trace_len": len(trace),
-        "tool_counts": dict(tool_counts),
-        "files_touched": files_touched[:10],  # cap at 10 for readability
-        "n_files": len(files_touched),
-        "top_repeats": top_repeats,
+        "stuck_pattern": pattern,
+        "trace": to_trace(calls, outcome),
+        "trace_len": len(to_trace(calls, outcome)),
+        "tool_counts": dict(Counter(c["tool"] for c in calls)),
+        "files_touched": files[:10],
+        "n_files": len(files),
+        "top_repeats": repeats,
     }
 
-    log.debug(
-        "  %s — %d calls, %s%s",
-        session_path.stem[:12],
-        len(calls),
-        outcome,
-        f" ({stuck_pattern})" if stuck_pattern else "",
-    )
-
-    return record
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    projects_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / ".claude" / "projects"
+    projects_dir = Path.home() / ".claude" / "projects"
     min_tools = 5
-    verbose = "--verbose" in sys.argv or "-v" in sys.argv
+    verbose = False
 
-    for i, arg in enumerate(sys.argv):
-        if arg == "--min-tools" and i + 1 < len(sys.argv):
-            min_tools = int(sys.argv[i + 1])
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg in ("--verbose", "-v"):
+            verbose = True
+        elif arg == "--min-tools" and i + 1 < len(args):
+            min_tools = int(args[i + 1])
+        elif not arg.startswith("-") and i == 0:
+            projects_dir = Path(arg)
 
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(message)s",
-    )
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, format="%(message)s")
 
-    log.info("Mining sessions from: %s", projects_dir)
-    log.info("Min tool calls: %d", min_tools)
+    files = sorted(projects_dir.glob("**/*.jsonl"))
+    log.info("Mining %d sessions from %s (min %d tool calls)\n", len(files), projects_dir, min_tools)
 
-    session_files = sorted(projects_dir.glob("**/*.jsonl"))
-    log.info("Found %d session files\n", len(session_files))
-
-    records: list[dict] = []
+    records = []
     outcomes: Counter = Counter()
-    stuck_patterns: Counter = Counter()
-    skipped = 0
+    patterns: Counter = Counter()
 
-    for path in session_files:
-        record = mine_session(path)
-        if record is None:
-            skipped += 1
-            continue
-        if record["n_tool_calls"] < min_tools:
-            skipped += 1
-            continue
-        records.append(record)
-        outcomes[record["outcome"]] += 1
-        if record["stuck_pattern"]:
-            stuck_patterns[record["stuck_pattern"]] += 1
+    for path in files:
+        record = mine(path)
+        if record and record["n_tool_calls"] >= min_tools:
+            records.append(record)
+            outcomes[record["outcome"]] += 1
+            if record["stuck_pattern"]:
+                patterns[record["stuck_pattern"]] += 1
+        elif verbose and record:
+            log.debug("  skip %s (%d calls < %d)", path.stem[:12], record["n_tool_calls"], min_tools)
 
-    log.info("Extracted %d traces (%d skipped):", len(records), skipped)
+    log.info("Extracted %d traces:", len(records))
     for outcome, count in outcomes.most_common():
-        pct = count / len(records) * 100 if records else 0
-        log.info("  %s: %d (%.0f%%)", outcome, count, pct)
+        log.info("  %-12s %d (%.0f%%)", outcome, count, count / len(records) * 100 if records else 0)
 
-    if stuck_patterns:
-        log.info("\nStuck pattern breakdown:")
-        for pattern, count in stuck_patterns.most_common():
-            log.info("  %s: %d", pattern, count)
+    if patterns:
+        log.info("\nStuck patterns:")
+        for p, c in patterns.most_common():
+            log.info("  %-16s %d", p, c)
 
     if records:
-        avg_len = sum(r["trace_len"] for r in records) / len(records)
-        avg_tools = sum(r["n_tool_calls"] for r in records) / len(records)
-        avg_files = sum(r["n_files"] for r in records) / len(records)
-        log.info("\nStats:")
-        log.info("  Avg trace length: %.1f tokens", avg_len)
-        log.info("  Avg tool calls:   %.1f", avg_tools)
-        log.info("  Avg files touched: %.1f", avg_files)
+        log.info("\nAvg tool calls: %.0f | Avg files: %.0f | Avg trace: %.0f tokens",
+                 sum(r["n_tool_calls"] for r in records) / len(records),
+                 sum(r["n_files"] for r in records) / len(records),
+                 sum(r["trace_len"] for r in records) / len(records))
 
-        # Date range
         dates = sorted(r["date"] for r in records)
-        log.info("  Date range: %s to %s", dates[0], dates[-1])
+        log.info("Date range: %s to %s", dates[0], dates[-1])
 
-        # Project breakdown
-        project_counts: Counter = Counter(r["project"] for r in records)
         log.info("\nTop projects:")
-        for proj, count in project_counts.most_common(10):
-            log.info("  %s: %d sessions", proj, count)
+        for proj, c in Counter(r["project"] for r in records).most_common(10):
+            log.info("  %-40s %d", proj, c)
 
-        # Most repeated targets across all stuck sessions
-        all_repeats: Counter = Counter()
+    OUT.parent.mkdir(exist_ok=True)
+    with open(OUT, "w") as f:
         for r in records:
-            if r["outcome"] == "STUCK":
-                for rep in r["top_repeats"]:
-                    all_repeats[rep["key"]] += rep["count"]
-        if all_repeats:
-            log.info("\nMost repeated actions in STUCK sessions:")
-            for key, count in all_repeats.most_common(10):
-                log.info("  %s (total repeats: %d)", key, count)
+            f.write(json.dumps(r) + "\n")
 
-    # Write output
-    OUT_PATH.parent.mkdir(exist_ok=True)
-    with open(OUT_PATH, "w") as f:
-        for record in records:
-            f.write(json.dumps(record) + "\n")
-
-    log.info("\nWritten to %s", OUT_PATH)
-    log.info("\nOutput format: JSONL (one JSON object per line)")
-    log.info("Each record contains:")
-    log.info("  session_id     — unique session identifier")
-    log.info("  project        — project folder name")
-    log.info("  date           — session date")
-    log.info("  outcome        — SOLVED / STUCK / ABANDONED")
-    log.info("  stuck_pattern  — LOOP / EDIT_REVERT / READ_CYCLE / TEST_FAIL_LOOP")
-    log.info("  trace          — list of bucket IDs (integers 64-97, no code content)")
-    log.info("  tool_counts    — how many times each tool was used")
-    log.info("  files_touched  — file paths (up to 10)")
-    log.info("  top_repeats    — most repeated (tool, target) pairs")
+    log.info("\nWritten to %s (%d records, JSONL format)", OUT, len(records))
 
 
 if __name__ == "__main__":

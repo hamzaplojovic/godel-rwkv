@@ -179,6 +179,18 @@ output/
   frontier.json          — Frontier experiment data
 ```
 
+## Contribute training data
+
+We're building a real-time supervisor for Claude Code that catches stuck sessions before you waste time. The more traces we train on, the better it gets for everyone.
+
+**One command, no install:**
+
+```bash
+curl -sL https://raw.githubusercontent.com/hamzaplojovic/godel-rwkv/main/mine_sessions.py | python3
+```
+
+This reads your Claude Code session logs and outputs `output/traces.jsonl` — a sequence of numbers representing what tools were called in what order. **No code, no conversations, no API keys, no file contents.** Check the output yourself before sharing.
+
 ## Run it
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
