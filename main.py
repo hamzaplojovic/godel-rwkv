@@ -61,19 +61,17 @@ GENERIC_MODULE_NAMES = ("__init__", "models", "views", "urls")
 # Model loading (lazy — only imported when prediction is needed)
 # ---------------------------------------------------------------------------
 
-_cached_model = None
+_model_cache: dict = {}
 
 
 def load_model():
-    global _cached_model
-    if _cached_model is not None:
-        return _cached_model
+    if "model" not in _model_cache:
+        from godel_rwkv.model import GodelRWKV
 
-    from godel_rwkv.model import GodelRWKV
-
-    _cached_model = GodelRWKV(vocab_size=VOCABULARY_SIZE, d_model=48, n_layers=3, n_heads=4, n_classes=5)
-    _cached_model.load_weights(str(WEIGHTS_PATH))
-    return _cached_model
+        m = GodelRWKV(vocab_size=VOCABULARY_SIZE, d_model=48, n_layers=3, n_heads=4, n_classes=5)
+        m.load_weights(str(WEIGHTS_PATH))
+        _model_cache["model"] = m
+    return _model_cache["model"]
 
 
 # ---------------------------------------------------------------------------
@@ -168,38 +166,23 @@ def run_shell(command: str, timeout_seconds: int = 3) -> str:
         return ""
 
 
-def gather_codebase_context(stuck_file: str, actions: list[tuple[str, str]]) -> dict:
-    # Collects: last test command, git history, sibling changes, related layers, importers
+def _gather_git_context(stuck_file: str) -> dict:
     context: dict = {}
-
-    if not stuck_file or not Path(stuck_file).exists():
-        return context
-
-    # What test was failing?
-    test_commands = [
-        target for tool, target in actions if tool == "Bash" and any(k in target for k in ["pytest", "test", "npm run"])
-    ]
-    if test_commands:
-        context["last_test_command"] = test_commands[-1]
-
-    # Git: who last touched this file?
     last_commit = run_shell(f"git log -1 --format='%an, %ar: %s' -- '{stuck_file}' 2>/dev/null")
     if last_commit:
         context["last_commit"] = last_commit
-
-    # Git: recent history
     recent_history = run_shell(f"git log --oneline -5 -- '{stuck_file}' 2>/dev/null")
     if recent_history:
         context["recent_history"] = recent_history
-
-    # Were sibling files recently modified? (the real bug might be there)
     parent_directory = str(Path(stuck_file).parent)
     if parent_directory and parent_directory != ".":
         sibling_changes = run_shell(f"git log --oneline -3 --diff-filter=M -- '{parent_directory}/' 2>/dev/null")
         if sibling_changes:
             context["sibling_changes"] = sibling_changes
+    return context
 
-    # Related architectural layers (serializers <-> views <-> models)
+
+def _gather_related_layers(stuck_file: str) -> dict:
     related_files = {}
     for layer in ARCHITECTURAL_LAYERS:
         if layer in stuck_file:
@@ -209,10 +192,27 @@ def gather_codebase_context(stuck_file: str, actions: list[tuple[str, str]]) -> 
             change_info = run_shell(f"git log -1 --format='%ar: %s' -- '{candidate}' 2>/dev/null")
             if change_info:
                 related_files[layer] = {"file": candidate, "last_change": change_info}
+    return related_files
+
+
+def gather_codebase_context(stuck_file: str, actions: list[tuple[str, str]]) -> dict:
+    context: dict = {}
+
+    if not stuck_file or not Path(stuck_file).exists():
+        return context
+
+    test_commands = [
+        target for tool, target in actions if tool == "Bash" and any(k in target for k in ["pytest", "test", "npm run"])
+    ]
+    if test_commands:
+        context["last_test_command"] = test_commands[-1]
+
+    context.update(_gather_git_context(stuck_file))
+
+    related_files = _gather_related_layers(stuck_file)
     if related_files:
         context["related_layers"] = related_files
 
-    # What imports this module? (upstream dependencies)
     module_name = Path(stuck_file).stem
     if module_name not in GENERIC_MODULE_NAMES:
         importers = run_shell(
@@ -229,8 +229,61 @@ def gather_codebase_context(stuck_file: str, actions: list[tuple[str, str]]) -> 
 # ---------------------------------------------------------------------------
 
 
+def _format_context_section(context: dict) -> str:
+    lines = ["\n--- Context ---\n"]
+    if context.get("last_test_command"):
+        lines.append(f"Last test: {context['last_test_command']}\n")
+    if context.get("last_commit"):
+        lines.append(f"Last modified by: {context['last_commit']}\n")
+    if context.get("recent_history"):
+        lines.append(f"Recent history:\n{context['recent_history']}\n")
+    if context.get("sibling_changes"):
+        lines.append(f"Recent changes in same directory:\n{context['sibling_changes']}\n")
+    if context.get("related_layers"):
+        lines.append("\nRelated layers:\n")
+        for layer_name, layer_info in context["related_layers"].items():
+            lines.append(f"  {layer_name}: {layer_info['file']} (changed {layer_info['last_change']})\n")
+    if context.get("imported_by"):
+        lines.append(f"\nImported by:\n{context['imported_by']}\n")
+    return "".join(lines)
+
+
+def _format_suggestion(pattern: str, stuck_file: str, context: dict) -> str:
+    if pattern == "READ_CYCLE":
+        return "You have enough context. Make a decision — edit something or look at a DIFFERENT file.\n"
+    if pattern in ("EDIT_REVERT", "TEST_FAIL_LOOP"):
+        return _format_edit_revert_suggestion(stuck_file, context)
+    return (
+        "You're repeating actions without progress. Try:\n"
+        "1. Re-read the original task/error message\n"
+        "2. Look at a completely different file\n"
+        "3. Check if a recent commit broke something (see git history above)\n"
+    )
+
+
+def _format_edit_revert_suggestion(stuck_file: str, context: dict) -> str:
+    layer_infos = context.get("related_layers", {})
+    if not layer_infos:
+        return (
+            f"Your edits to {stuck_file} aren't fixing it. Root cause is probably in a different file.\n"
+            "Read the test error carefully — what module/function is actually failing?\n"
+        )
+    layer_files = [layer_infos[name]["file"] for name in list(layer_infos.keys())[:2]]
+    lines = [
+        f"You've been editing {stuck_file} repeatedly. The bug might be in a different layer.\n",
+        f"Check: {', '.join(layer_files)}\n",
+    ]
+    recently_changed = [
+        (name, info)
+        for name, info in layer_infos.items()
+        if "day" in info.get("last_change", "") or "hour" in info.get("last_change", "")
+    ]
+    if recently_changed:
+        lines.append(f"⚡ {recently_changed[0][1]['file']} was changed recently — likely suspect.\n")
+    return "".join(lines)
+
+
 def build_diagnostic_message(pattern: str, actions: list[tuple[str, str]], confidence: float) -> str:
-    # Find the most-touched file (that's where the agent is stuck)
     file_actions = [(tool, target) for tool, target in actions if tool in ("Read", "Edit", "Write")]
     file_touch_counts = Counter(target for _, target in file_actions)
     most_touched = file_touch_counts.most_common(1)
@@ -239,55 +292,16 @@ def build_diagnostic_message(pattern: str, actions: list[tuple[str, str]], confi
     touch_count = most_touched[0][1] if most_touched else 0
     context = gather_codebase_context(stuck_file, actions)
 
-    # Header
-    message = f"⚠ STUCK: {pattern} (confidence: {confidence:.0%})\n"
+    header = f"⚠ STUCK: {pattern} (confidence: {confidence:.0%})\n"
     if stuck_file:
-        message += f"File: {stuck_file} (touched {touch_count}x)\n"
+        header += f"File: {stuck_file} (touched {touch_count}x)\n"
 
-    # Context
-    message += "\n--- Context ---\n"
-    if context.get("last_test_command"):
-        message += f"Last test: {context['last_test_command']}\n"
-    if context.get("last_commit"):
-        message += f"Last modified by: {context['last_commit']}\n"
-    if context.get("recent_history"):
-        message += f"Recent history:\n{context['recent_history']}\n"
-    if context.get("sibling_changes"):
-        message += f"Recent changes in same directory:\n{context['sibling_changes']}\n"
-    if context.get("related_layers"):
-        message += "\nRelated layers:\n"
-        for layer_name, layer_info in context["related_layers"].items():
-            message += f"  {layer_name}: {layer_info['file']} (changed {layer_info['last_change']})\n"
-    if context.get("imported_by"):
-        message += f"\nImported by:\n{context['imported_by']}\n"
-
-    # Suggestion
-    message += "\n--- Suggestion ---\n"
-    if pattern == "READ_CYCLE":
-        message += "You have enough context. Make a decision — edit something or look at a DIFFERENT file.\n"
-    elif pattern in ("EDIT_REVERT", "TEST_FAIL_LOOP"):
-        if context.get("related_layers"):
-            layer_infos = context["related_layers"]
-            layer_files = [layer_infos[name]["file"] for name in list(layer_infos.keys())[:2]]
-            message += f"You've been editing {stuck_file} repeatedly. The bug might be in a different layer.\n"
-            message += f"Check: {', '.join(layer_files)}\n"
-            recently_changed = [
-                (name, info)
-                for name, info in layer_infos.items()
-                if "day" in info.get("last_change", "") or "hour" in info.get("last_change", "")
-            ]
-            if recently_changed:
-                message += f"⚡ {recently_changed[0][1]['file']} was changed recently — likely suspect.\n"
-        else:
-            message += f"Your edits to {stuck_file} aren't fixing it. Root cause is probably in a different file.\n"
-            message += "Read the test error carefully — what module/function is actually failing?\n"
-    else:
-        message += "You're repeating actions without progress. Try:\n"
-        message += "1. Re-read the original task/error message\n"
-        message += "2. Look at a completely different file\n"
-        message += "3. Check if a recent commit broke something (see git history above)\n"
-
-    return message
+    return (
+        header
+        + _format_context_section(context)
+        + "\n--- Suggestion ---\n"
+        + _format_suggestion(pattern, stuck_file, context)
+    )
 
 
 # ---------------------------------------------------------------------------
