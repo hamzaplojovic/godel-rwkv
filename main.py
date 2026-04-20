@@ -18,6 +18,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+
+# Canary: write to log on every invocation — proves hook is being called at all
+import os as _os
+import time as _time
+from pathlib import Path as _Path
+_log = _Path.home() / ".cache" / "godel-rwkv" / "invocations.log"
+_log.parent.mkdir(parents=True, exist_ok=True)
+with _log.open("a") as _f:
+    _f.write(f"{_time.time():.0f} pid={_os.getpid()} ppid={_os.getppid()}\n")
 import os
 import subprocess
 import sys
