@@ -29,7 +29,6 @@ v2 vocabulary — raw state bucket encoding:
   the full trace to find COLLAPSE_V2.
 """
 
-import random
 from typing import Optional
 from dataclasses import dataclass
 
@@ -267,24 +266,5 @@ def omega() -> Term:
     return App(sii, sii)
 
 
-PROB_PICK_S_COMBINATORINATOR = 0.3
-PROB_PICK_K_COMBINATOR = 0.6
-_TERM_THRESH_IDENTITY_COMBINATOR = 0.8
-
-
-def random_term(size: int, var_names: int = 4) -> Term:
-    """Generate a random SKI term of approximately given size."""
-    if size <= 1:
-        r = random.random()
-        if r < PROB_PICK_S_COMBINATORINATOR:
-            return S_COMBINATOR
-        if r < PROB_PICK_K_COMBINATOR:
-            return K_COMBINATOR
-        if r < _TERM_THRESH_IDENTITY_COMBINATOR:
-            return IDENTITY_COMBINATOR
-        return Var(random.randint(0, var_names - 1))
-    left_size = random.randint(1, size - 1)
-    right_size = size - left_size
-    return App(random_term(left_size, var_names), random_term(right_size, var_names))
 
 

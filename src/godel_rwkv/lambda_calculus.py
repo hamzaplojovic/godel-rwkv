@@ -15,7 +15,6 @@ Diverging terms (Godel analogs):
 """
 
 import random
-import mlx.core as mx
 
 from typing import Optional
 from dataclasses import dataclass
@@ -29,7 +28,6 @@ from godel_rwkv.ski import (
     END_V2,
     MAX_SEQ_LEN_V2,
     MAX_STEPS_V2,
-    pad_trace_v2,
     emit_result_tail,
 )
 

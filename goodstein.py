@@ -50,7 +50,6 @@ from godel_rwkv.ski import (
     VOCAB_SIZE_V2, MAX_SEQ_LEN_V2, pad_trace_v2, emit_result_tail,
     COLLAPSE_V2, END_V2, TM_BUCKET_BASE, N_BUCKETS, LABEL_SOLVABLE, LABEL_STUCK,
 )
-from godel_rwkv.curriculum import LastTokenClassifier, ContainsCollapseClassifier
 from godel_rwkv.model import GodelRWKV
 
 OUT_DIR    = Path("output")
@@ -197,8 +196,6 @@ def run_goodstein_experiment() -> None:
     model.load_weights(str(MODEL_PATH))
     print(f"Loaded: {MODEL_PATH}  ({model.count_params():,} params)\n")
 
-    contains_collapse = ContainsCollapseClassifier()
-
     # Compute true lengths for small n (these are feasible)
     print("Computing Goodstein sequence lengths (may take a moment for n≥3)...")
     true_lengths: dict[int, int | str] = {}
@@ -247,10 +244,10 @@ def run_goodstein_experiment() -> None:
     if gap_cases:
         print(f"\nGap begins at n={gap_cases[0]['n']}:")
         print(f"  Model predicts STUCK (no COLLAPSE seen in {gap_cases[0]['trace_steps']} steps)")
-        print(f"  True answer: SOLVABLE (Goodstein theorem — provable in ZFC, not PA)")
-        print(f"  The model's failure boundary = PA's incompleteness boundary")
+        print("  True answer: SOLVABLE (Goodstein theorem — provable in ZFC, not PA)")
+        print("  The model's failure boundary = PA's incompleteness boundary")
 
-    print(f"""
+    print("""
 === THE PENROSE CONNECTION ===
 
 Penrose argues: human minds transcend formal systems because they can "see"

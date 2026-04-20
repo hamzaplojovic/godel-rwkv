@@ -29,8 +29,8 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-from godel_rwkv.ski import VOCAB_SIZE_V2, MAX_SEQ_LEN_V2, pad_trace_v2, COLLAPSE_V2, END_V2
-from godel_rwkv.turing_machine import build_collatz_test_set_v2, generate_collatz_trace_v2
+from godel_rwkv.ski import VOCAB_SIZE_V2
+from godel_rwkv.turing_machine import build_collatz_test_set_v2
 from godel_rwkv.curriculum import LastTokenClassifier, ContainsCollapseClassifier
 from godel_rwkv.model import GodelRWKV
 
@@ -48,11 +48,11 @@ def classify(model, seqs: mx.array) -> list[int]:
     parts = [model(seqs[i:i+CHUNK]) for i in range(0, seqs.shape[0], CHUNK)]
     logits = mx.concatenate(parts, axis=0)
     mx.eval(logits)
-    return [1 if float(l.item()) > 0 else 0 for l in logits]
+    return [1 if float(v.item()) > 0 else 0 for v in logits]
 
 
 def accuracy(preds: list[int], labels: list[int]) -> float:
-    return sum(p == l for p, l in zip(preds, labels)) / len(labels)
+    return sum(p == t for p, t in zip(preds, labels)) / len(labels)
 
 
 def run_collatz_experiment() -> None:
@@ -78,10 +78,10 @@ def run_collatz_experiment() -> None:
         model_preds    = classify(model, seqs)
         lt_preds_raw   = last_token_clf(seqs)
         mx.eval(lt_preds_raw)
-        lt_preds       = [1 if float(l.item()) > 0 else 0 for l in lt_preds_raw]
+        lt_preds       = [1 if float(v.item()) > 0 else 0 for v in lt_preds_raw]
         cc_preds_raw   = contains_collapse(seqs)
         mx.eval(cc_preds_raw)
-        cc_preds       = [1 if float(l.item()) > 0 else 0 for l in cc_preds_raw]
+        cc_preds       = [1 if float(v.item()) > 0 else 0 for v in cc_preds_raw]
 
         model_acc = accuracy(model_preds, labels)
         lt_acc    = accuracy(lt_preds,    labels)
@@ -100,21 +100,20 @@ def run_collatz_experiment() -> None:
         print(f"  LastTokenBaseline:        {lt_acc:.4f}")
 
         if tier == "budget":
-            print(f"\n  Budget-boundary cases (true sequence length vs trace length):")
+            print("\n  Budget-boundary cases (true sequence length vs trace length):")
             print(f"  {'n':>10}  {'true_steps':>10}  {'trace_len':>10}  {'model':>8}  {'correct_for_trace':>18}")
             for i, (n_info, pred, lbl) in enumerate(zip(ns, model_preds, labels)):
                 n, steps, true_len = n_info
                 pred_str = "SOLVABLE" if pred == 0 else "STUCK"
-                lbl_str  = "SOLVABLE" if lbl  == 0 else "STUCK"
                 # For budget tier: label=STUCK (trace cut), but TRUE is SOLVABLE
                 trace_correct = (pred == lbl)
                 true_correct  = (pred == 0)  # true answer is always SOLVABLE for Collatz
                 print(f"  {n:>10}  {true_len if true_len > 0 else '???':>10}  {steps:>10}  {pred_str:>8}  "
                       f"{'✓ (trace)' if trace_correct else '✗'} / {'✓ (truth)' if true_correct else '✗ (gap)'}")
-            print(f"\n  The '✗ (gap)' rows ARE the undecidability gap: the model correctly")
-            print(f"  reports what the trace shows (no COLLAPSE seen = STUCK from trace POV)")
-            print(f"  but the TRUE mathematical answer is SOLVABLE (Collatz conjecture).")
-            print(f"  This is exactly where any bounded algorithm fails.")
+            print("\n  The '✗ (gap)' rows ARE the undecidability gap: the model correctly")
+            print("  reports what the trace shows (no COLLAPSE seen = STUCK from trace POV)")
+            print("  but the TRUE mathematical answer is SOLVABLE (Collatz conjecture).")
+            print("  This is exactly where any bounded algorithm fails.")
         print()
 
     # Write results

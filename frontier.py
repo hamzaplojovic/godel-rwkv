@@ -24,9 +24,7 @@ import numpy as np
 from godel_rwkv.ski import (
     VOCAB_SIZE_V2, MAX_SEQ_LEN_V2, pad_trace_v2, emit_result_tail,
     COLLAPSE_V2, END_V2, TM_BUCKET_BASE, N_BUCKETS,
-    LABEL_SOLVABLE, LABEL_STUCK,
 )
-from godel_rwkv.turing_machine import generate_tm_trace_v2, run_one_tm_step
 from godel_rwkv.model import GodelRWKV
 
 OUT_DIR    = Path("output")
@@ -593,8 +591,8 @@ def run_frontier() -> None:
     toks, outcome = generate_zfc_consistency_trace()
     pred = predict(model, toks)
     print(f"  Consistency TM C_F:  model={pred}")
-    print(f"  Note: this is a synthetic trace (74 unique bucket IDs, no COLLAPSE).")
-    print(f"  The STUCK prediction is trivially correct — not a meaningful assertion.")
+    print("  Note: this is a synthetic trace (74 unique bucket IDs, no COLLAPSE).")
+    print("  The STUCK prediction is trivially correct — not a meaningful assertion.")
     all_results["zfc_consistency"] = {"model": pred, "note": "synthetic — trivially STUCK"}
 
     # ------------------------------------------------------------------

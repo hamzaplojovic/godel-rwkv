@@ -29,8 +29,6 @@ from godel_rwkv.ski import (
     emit_result_tail,
 )
 
-_MAX_TAPE = 50  # tape beyond this → BACK (divergence by growth)
-_MAX_STEPS = 200  # step limit → BACK
 
 # TM config: (state: int, head: int, tape: tuple[int, ...])
 TMConfig = tuple[int, int, tuple[int, ...]]
@@ -64,8 +62,8 @@ def run_one_tm_step(table: TMTable, cfg: TMConfig) -> Optional[TMConfig]:
 def make_cycle_machine(n_states: int) -> tuple[TMTable, TMConfig]:
     """
     n_states-cycle TM. Alternates R/L to stay bounded. Returns to start
-    config after 2*n_states steps → REVISIT.
-    Trace length: 2*n_states NEW + REVISIT = 2*n_states+1 tokens.
+    config after 2*n_states steps → cycle detected.
+    Trace: 2*n_states bucket IDs + END.
     """
     table: TMTable = {}
     for i in range(n_states):
@@ -80,7 +78,7 @@ def make_cycle_machine(n_states: int) -> tuple[TMTable, TMConfig]:
 def make_write_cycle_machine(n_states: int) -> tuple[TMTable, TMConfig]:
     """
     Cycle TM that also writes: writes 1 then restores 0 on the way back.
-    Still cycles but with tape writes → REVISIT after 2*n_states steps.
+    Still cycles but with tape writes → cycle detected after 2*n_states steps.
     """
     table: TMTable = {}
     for i in range(n_states):
@@ -97,7 +95,7 @@ def make_scan_halt_machine(n_ones: int) -> tuple[TMTable, TMConfig]:
     """
     Scan rightward over n ones then halt on blank (symbol 0).
     Transition: (0, 1) → (0, 1, R). No transition on (0, 0) → halt.
-    Trace: [NEW]*n_ones + [COLLAPSE].  Length = n_ones+1.
+    Trace: n_ones bucket IDs + COLLAPSE + result tail + END.
     """
     table: TMTable = {(0, 1): (0, 1, 1)}
     tape = tuple([1] * n_ones + [0])
@@ -109,7 +107,7 @@ def make_write_halt_machine(n_writes: int) -> tuple[TMTable, TMConfig]:
     """
     Write n_writes symbols then halt.
     State i writes 1 and moves R to state i+1. State n_writes has no transition → halt.
-    Trace: [NEW]*n_writes + [COLLAPSE].
+    Trace: n_writes bucket IDs + COLLAPSE + result tail + END.
     """
     table: TMTable = {}
     for i in range(n_writes):
@@ -123,7 +121,7 @@ def make_write_halt_machine(n_writes: int) -> tuple[TMTable, TMConfig]:
 def make_bounce_halt_machine(n_steps: int) -> tuple[TMTable, TMConfig]:
     """
     Go right n_steps, then switch direction and go left n_steps, then halt.
-    Uses 2*n_steps+1 states. Trace: [NEW]*(2*n_steps) + [COLLAPSE].
+    Uses 2*n_steps+1 states. Trace: 2*n_steps bucket IDs + COLLAPSE + result tail + END.
     """
     table: TMTable = {}
     total = n_steps * 2
@@ -188,7 +186,7 @@ def generate_tm_trace_v2(table: TMTable, initial: TMConfig) -> tuple[list[int], 
     return tokens, LABEL_STUCK
 
 
-def build_diagonal_machine() -> tuple[TMTable, "Callable"]:
+def build_diagonal_machine() -> tuple[TMTable, object]:
     """
     The diagonal TM: D halts iff COLLAPSE_V2 (=96) does NOT appear in its input tape.
 
@@ -216,8 +214,6 @@ def build_diagonal_machine() -> tuple[TMTable, "Callable"]:
         - This creates a cycle: (1, h, tape) → (2, h+1, tape) → (1, h, tape).
         - Cycle detection in generate_tm_trace_v2 fires, producing repeated bucket IDs.
     """
-    from typing import Callable as _Callable
-
     table: TMTable = {}
 
     # State 0: scan for COLLAPSE_V2
@@ -241,38 +237,10 @@ def build_diagonal_machine() -> tuple[TMTable, "Callable"]:
 
 
 _MIN_CYCLE = 2
-_MAX_CYCLE = 25  # 2*25=50 NEW tokens + REVISIT = 51 tokens, within MAX_SEQ_LEN=64
+_MAX_CYCLE = 25
 
 
 
-
-def make_collatz_machine() -> tuple[TMTable, "Callable[[int], TMConfig]"]:
-    """
-    TM implementing the Collatz (3n+1) iteration using unary encoding.
-
-    Tape: n ones followed by a blank. State machine:
-      - Count tape length (= n).
-      - If n == 1: halt (COLLAPSE — reached fixed point).
-      - If n even: divide by 2 (remove every other 1).
-      - If n odd:  multiply by 3 and add 1 (write 3n+1 ones).
-
-    For v2 encoding this uses TM bucket IDs 64-95 — same unseen range as the
-    zero-shot test. No training needed; the existing model classifies zero-shot.
-
-    Implementation uses a simpler but equivalent approach: simulate in Python,
-    generate the sequence of (n_value, step) configs, feed as a TM trace.
-    Each config = (collatz_value, step_count) — unique per step for halting
-    sequences, and would repeat only if the value cycles (which Collatz never
-    does for tested values — that's the conjecture).
-    """
-    from typing import Callable as _Callable
-
-    # We don't need an actual TM table — we simulate directly and emit configs
-    # as (value, step) pairs. The TM "config" is just the integer value at each step.
-    # This is equivalent to a TM that tracks the current Collatz value.
-    # Using the TMConfig type: (state=0, head=value, tape=(step,))
-    # — unique per step, no repeated configs for terminating sequences.
-    return {}, lambda n: (0, n, (0,))  # placeholder, not used directly
 
 
 def generate_collatz_trace_v2(n: int, budget: int = 500) -> tuple[list[int], int, int]:
@@ -280,7 +248,7 @@ def generate_collatz_trace_v2(n: int, budget: int = 500) -> tuple[list[int], int
     Generate a v2 trace for Collatz starting at n.
 
     Each step emits tm_bucket(hash((value, step))) — unique per step because
-    step is included, so no false REVISIT signals from value repetition.
+    step is included, so no false cycle signals from value repetition.
     True SOLVABLE iff sequence reaches 1 within budget.
 
     Returns: (tokens, true_label, steps_taken)

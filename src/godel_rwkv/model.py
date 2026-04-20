@@ -1,14 +1,12 @@
 """
-GodelRWKV — RWKV-7 binary classifier for SKI termination detection.
+GodelRWKV — RWKV-7 binary classifier for computation trace halting detection.
 
-Input:  token sequence (B, T) from 7-token vocabulary
-Output: logit for STUCK (scalar per sequence)
+Input:  token sequence (B, T) from 100-token v2 vocabulary
+        (bucket IDs 0-95, COLLAPSE=96, END=97, PAD=98, CLS=99)
+Output: logit for STUCK (scalar per sequence, positive = stuck)
 
-Architecture: RWKV-7 blocks -> mean-pool over non-PAD positions -> linear head
-~8K params at d=32, n_heads=4, n_layers=2
-
-The CLS token at position 0 carries the classification signal.
-We use its final hidden state (not mean-pool) for classification — same as BERT.
+Architecture: RWKV-7 blocks -> last-token hidden state -> linear head
+~101K params at d=48, n_heads=4, n_layers=3
 """
 
 import mlx.core as mx

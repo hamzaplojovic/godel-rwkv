@@ -32,8 +32,6 @@ from godel_rwkv.curriculum import (
     run_evaluation_battery_v2,
     print_evaluation_battery_v2,
     run_self_referential_test,
-    LastTokenClassifier,
-    ContainsCollapseClassifier,
 )
 from godel_rwkv.model import GodelRWKV, binary_cross_entropy_loss
 

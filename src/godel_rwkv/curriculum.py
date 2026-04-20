@@ -33,21 +33,16 @@ from godel_rwkv.ski import (
     N_BUCKETS,
     COLLAPSE_V2,
     END_V2,
-    PAD_V2,
-    CLS_V2,
-    VOCAB_SIZE_V2,
     generate_ski_trace_v2,
     emit_result_tail,
     omega,
     pad_trace_v2,
-    ski_bucket,
 )
 from godel_rwkv.lambda_calculus import (
     LApp,
     Lam,
     LVar,
     generate_lambda_trace_v2,
-    lam_bucket,
     omega_lam,
 )
 
@@ -64,9 +59,8 @@ ATOMIC_SKI_TERMS = [
 def wrap_omega_with_identity_chain(n_wraps: int) -> object:
     """
     (lambda.0)^n applied to omega_lam.
-    Each (lambda.0) x → x is one beta step (1 NEW token).
-    After n peels, omega_lam produces [NEW, REVISIT].
-    Total trace: n NEW tokens + NEW + REVISIT = n+2 tokens.
+    Each (lambda.0) x → x is one beta step (1 bucket ID).
+    After n peels, omega_lam diverges → stuck trace.
     """
     t: object = omega_lam()
     for _ in range(n_wraps):
@@ -110,7 +104,7 @@ def make_solvable_ski_term(n_steps: int) -> object:
 
 
 def make_stuck_ski_term() -> object:
-    """SKI stuck term — omega variants produce long BACK-terminated traces."""
+    """SKI stuck term — omega variants produce long stuck traces (no COLLAPSE)."""
     # Weights: 40% bare omega, 30% I-wrapped, 20% K-wrapped, 10% SKK-wrapped
     variant = random.choices(
         ["omega", "ichain", "k_wrap", "skk_wrap"],
@@ -119,14 +113,14 @@ def make_stuck_ski_term() -> object:
     if variant == "omega":
         return omega()
     if variant == "ichain":
-        return App(IDENTITY_COMBINATOR, omega())  # I(omega) → omega → BACK
+        return App(IDENTITY_COMBINATOR, omega())  # I(omega) → omega → stuck
     if variant == "k_wrap":
         return App(
             App(K_COMBINATOR, omega()), random.choice(ATOMIC_SKI_TERMS)
-        )  # K omega x → omega → BACK
+        )  # K omega x → omega → stuck
     return App(
         App(App(S_COMBINATOR, K_COMBINATOR), K_COMBINATOR), omega()
-    )  # S K K omega → omega → BACK
+    )  # S K K omega → omega → stuck
 
 
 def compute_accuracy(logits: mx.array, labels: list[int]) -> float:
@@ -249,8 +243,8 @@ def build_stage2_v2(n_per_class: int = 3000, seed: int = 11) -> dict:
             if sol_lbl == LABEL_SOLVABLE:
                 pairs.append((sol_toks, LABEL_SOLVABLE))
 
-    stuck_p  = [(t, l) for t, l in pairs if l == LABEL_STUCK]
-    sol_p    = [(t, l) for t, l in pairs if l == LABEL_SOLVABLE]
+    stuck_p  = [(t, lbl) for t, lbl in pairs if lbl == LABEL_STUCK]
+    sol_p    = [(t, lbl) for t, lbl in pairs if lbl == LABEL_SOLVABLE]
     while len(stuck_p) < n_per_class:
         n_wraps = random.randint(0, 20)
         t = wrap_omega_with_identity_chain(n_wraps)
