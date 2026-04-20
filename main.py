@@ -364,7 +364,7 @@ def main() -> None:
     state["total_alerts_fired"] += 1
     write_session_state(state)
 
-    print(build_diagnostic_message(pattern, state["actions"], confidence), file=sys.stderr)
+    print(build_diagnostic_message(pattern, state["actions"], confidence))
 
 
 if __name__ == "__main__":
