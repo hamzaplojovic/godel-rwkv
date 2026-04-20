@@ -349,7 +349,7 @@ def main() -> None:
 
     # Run prediction
     try:
-        pattern, confidence = predict_pattern(state["actions"])
+        pattern, confidence = predict_pattern(state["actions"][-20:])
     except Exception:
         write_session_state(state)
         return
