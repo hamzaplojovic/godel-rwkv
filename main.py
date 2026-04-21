@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -76,6 +77,10 @@ EARLY_REPEAT_THRESHOLD = 1
 
 SESSION_DIR = Path.home() / ".cache" / "godel-rwkv"
 SESSION_TTL = 3600  # seconds
+TRACES_PATH = SESSION_DIR / "traces.jsonl"
+
+DAEMON_SOCK = "/tmp/godel.sock"
+DAEMON_TIMEOUT = 0.05  # 50ms
 
 WEIGHTS_PATH = Path(__file__).parent / "weights" / "classifier.npz"
 SUCCESS_WEIGHTS_PATH = Path(__file__).parent / "weights" / "success.npz"
@@ -103,6 +108,71 @@ def _pad(toks: list[int]) -> list[int]:
     if len(toks) > MC_MAX_SEQ:
         toks = toks[-MC_MAX_SEQ:]
     return [MC_PAD] * (MC_MAX_SEQ - len(toks)) + toks
+
+
+# ---------------------------------------------------------------------------
+# Daemon socket inference
+# ---------------------------------------------------------------------------
+
+def _daemon_predict_raw(tokens: list[int], model: str) -> list[float] | None:
+    """Send tokens to daemon, return logits list or None if daemon unavailable."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(DAEMON_TIMEOUT)
+        s.connect(DAEMON_SOCK)
+        req = json.dumps({"tokens": tokens, "model": model}) + "\n"
+        s.sendall(req.encode())
+        resp = s.recv(1024).decode()
+        s.close()
+        data = json.loads(resp)
+        if "logits" in data:
+            return data["logits"]
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Session logging
+# ---------------------------------------------------------------------------
+
+def _heuristic_label(actions: list[tuple[str, str]]) -> int:
+    """1 if last Bash action looks like a commit/push, else 0."""
+    for tool, target in reversed(actions):
+        if tool == "Bash":
+            t = target.lower()
+            if "git commit" in t or "git push" in t:
+                return 1
+            return 0
+    return 0
+
+
+def _log_session(s: dict) -> None:
+    """Append finished session to traces.jsonl if worth logging."""
+    actions = [tuple(a) for a in s.get("actions", [])]
+    if len(actions) < 3:
+        return
+
+    n_alerts = s.get("n_alerts", 0)
+    p_success = s.get("last_p_success")
+
+    # Log if: alert fired, OR P(success) in uncertain band 0.3-0.7
+    if n_alerts == 0 and (p_success is None or not (0.30 <= p_success <= 0.70)):
+        return
+
+    label = _heuristic_label(actions)
+    record = {
+        "actions": [[t, tgt] for t, tgt in actions],
+        "label": label,
+        "ts": int(s.get("ts", time.time())),
+        "n_alerts": n_alerts,
+    }
+    try:
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        with TRACES_PATH.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -158,33 +228,52 @@ def _load_success_model():
 
 def _predict_success(actions: list[tuple[str, str]]) -> float | None:
     """Return P(success) in [0, 1] or None if model unavailable."""
+    toks = _pad(_encode(actions))
+
+    # Try daemon first
+    logits = _daemon_predict_raw(toks, "success")
+    if logits is not None and len(logits) >= 1:
+        return float(1.0 / (1.0 + __import__("math").exp(-logits[0])))
+
+    # Fallback: MLX
     model = _load_success_model()
     if model is None:
         return None
     try:
         import mlx.core as mx
         import mlx.nn as nn
-        toks = _encode(actions)
-        x = mx.array([_pad(toks)], dtype=mx.int32)
+        x = mx.array([toks], dtype=mx.int32)
         logit = model(x)
-        prob = nn.sigmoid(logit).item()
-        return float(prob)
+        return float(nn.sigmoid(logit).item())
     except Exception:  # noqa: BLE001
         return None
 
 
 def _predict(actions: list[tuple[str, str]]) -> tuple[int, float] | None:
     """Return (class_id, confidence) or None if model unavailable."""
+    import math
+    toks = _pad(_encode(actions))
+
+    # Try daemon first
+    logits = _daemon_predict_raw(toks, "classifier")
+    if logits is not None and len(logits) == N_CLASSES:
+        max_l = max(logits)
+        exps = [math.exp(l - max_l) for l in logits]
+        s = sum(exps)
+        probs = [e / s for e in exps]
+        best = max(range(N_CLASSES), key=lambda i: probs[i])
+        return best, probs[best]
+
+    # Fallback: MLX
     model = _load_model()
     if model is None:
         return None
     try:
         import mlx.core as mx
         import mlx.nn as nn
-        toks = _encode(actions)
-        x = mx.array([_pad(toks)], dtype=mx.int32)
-        logits = model(x)
-        probs = nn.softmax(logits, axis=-1)
+        x = mx.array([toks], dtype=mx.int32)
+        logits_mx = model(x)
+        probs = nn.softmax(logits_mx, axis=-1)
         mx.eval(probs)
         probs_np = probs[0].tolist()
         best = max(range(N_CLASSES), key=lambda i: probs_np[i])
@@ -210,16 +299,20 @@ def _load_session() -> dict:
             s = json.loads(path.read_text())
             if time.time() - s.get("ts", 0) < SESSION_TTL:
                 return s
+            # Session expired — log it before discarding
+            _log_session(s)
         except (json.JSONDecodeError, KeyError):
             pass
     return {
-        "actions": [],       # list of [tool, target]
+        "actions": [],
         "ts": time.time(),
         "last_alert": -999,
         "total_calls": 0,
-        "budget_warned": [],   # which budget thresholds already warned
+        "budget_warned": [],
         "reads_since_edit": 0,
         "read_stall_warned": False,
+        "n_alerts": 0,
+        "last_p_success": None,
     }
 
 
@@ -529,14 +622,17 @@ def main() -> None:
             conf_str = f" (confidence: {confidence:.0%})" if confidence < 1.0 else ""
             output.append(f"{msg}{conf_str}")
             s["last_alert"] = step
+            s["n_alerts"] = s.get("n_alerts", 0) + 1
 
         # P(success) from SWE-bench success model (only when no pattern alert fired)
         if not alert_pattern:
             p_success = _predict_success(actions)
-            if p_success is not None and p_success < 0.25:
-                output.append(
-                    f"⚠  Trajectory confidence: {p_success:.0%} — session pattern resembles failed SWE-bench attempts."
-                )
+            if p_success is not None:
+                s["last_p_success"] = p_success
+                if p_success < 0.25:
+                    output.append(
+                        f"⚠  Trajectory confidence: {p_success:.0%} — session pattern resembles failed SWE-bench attempts."
+                    )
 
     _save_session(s)
 
