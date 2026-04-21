@@ -1,10 +1,14 @@
 # GodelRWKV
 
-A stuck-pattern supervisor for Claude Code.
+A stuck-pattern supervisor for Claude Code, trained on real SWE-bench outcomes.
 
-Watches every tool call in real time. When Claude gets stuck — editing the same file repeatedly, reading without acting, running failing tests in a loop — it fires a diagnostic message with codebase context that redirects Claude to the right approach.
+Watches every tool call. When Claude loops, thrashes, drifts, or resembles a failed coding attempt, it fires a diagnostic with codebase context and a concrete redirect.
 
-101K parameters. 5ms per inference. Zero API cost. Runs locally on Apple Silicon.
+Two models, both optional:
+- **classifier** — 9-class pattern detector trained on synthetic traces
+- **success** — binary P(success) trained on 84K real SWE-bench trajectories
+
+101K parameters. ~5ms per inference. Zero API cost. Runs locally on Apple Silicon.
 
 ## Install
 
@@ -28,72 +32,90 @@ Then add to `~/.claude/settings.json`:
 }]
 ```
 
-## What it does
+## What it detects
 
-After every tool call, the supervisor:
+### Stuck patterns (classifier)
 
-1. Hashes the action (tool name + target) into a token sequence
-2. Feeds the session trace into a trained RWKV-7 model
-3. If stuck pattern detected at 85%+ confidence, gathers context:
-   - Git history of the stuck file
-   - Recent changes in the same directory
-   - Related files (serializers, views, models, services)
-   - Who changed what and when
-4. Outputs a diagnosis that Claude reads and acts on
+| Pattern        | Meaning                                          |
+| -------------- | ------------------------------------------------ |
+| LOOP           | Same (tool, target) repeated 4+ times            |
+| EDIT_REVERT    | Same file edited repeatedly, tests still failing |
+| READ_CYCLE     | Same file read repeatedly without edits          |
+| TEST_FAIL_LOOP | Test command repeated, keeps failing             |
+| DRIFT          | Started on module A, pivoted to unrelated B      |
+| THRASH         | Edit A → Edit B → Edit A → Edit B cycle          |
+| SCOPE_CREEP    | Edits spread to 6+ files, no tests run           |
+| ABANDONED      | Edits stopped, session passive reads only        |
 
-## Example
+### Trajectory confidence (success model)
 
-Claude has been editing `orders/views.py` and running pytest in a loop for 8 tool calls:
+When no stuck pattern fires, the success model checks whether the session's tool-call sequence resembles a failed SWE-bench attempt. If P(success) < 25%, it warns:
 
 ```
-⚠ STUCK: LOOP (confidence: 98%)
-File: orders/views.py (touched 4x)
-
---- Context ---
-Last test: pytest tests/test_orders.py
-Last modified by: marko, 2 days ago: refactor provider polling
-Recent changes in same directory:
-  a3f91b Fix status propagation in sync task
-  e82c1d Update bundle serializer validation
-
-Related layers:
-  serializers: apps/eshop/serializers/catalogue.py (changed 2 days ago)
-  services: apps/sync/tasks.py (changed 2 days ago)
-
---- Suggestion ---
-You've been editing orders/views.py repeatedly. The bug might be in a different layer.
-Check: apps/eshop/serializers/catalogue.py, apps/sync/tasks.py
-⚡ apps/sync/tasks.py was changed recently — likely suspect.
+⚠  Trajectory confidence: 18% — session pattern resembles failed SWE-bench attempts.
 ```
 
-Claude reads this, stops editing views.py, checks the sync task, finds the bug.
+### Budget warnings
 
-## Patterns detected
+Fires at 50 / 70 / 90 cumulative tool calls, prompting a commit + fresh session.
 
-| Pattern        | What it means                                 | When it fires             |
-| -------------- | --------------------------------------------- | ------------------------- |
-| LOOP           | Same action repeated 3+ times                 | Generic repetition        |
-| EDIT_REVERT    | Same file edited repeatedly, tests still fail | Fixing symptoms not cause |
-| READ_CYCLE     | Same files read repeatedly without edits      | Analysis paralysis        |
-| TEST_FAIL_LOOP | Test command repeated, keeps failing          | Wrong file being edited   |
+### Read stall
+
+Fires when 10+ consecutive reads happen without an edit — suggests using Grep instead.
+
+## Example output
+
+```
+⚠  GodelRWKV detected: EDIT_REVERT
+
+  Repeatedly editing without resolution: orders/views.py
+  → Read the full error. Has the failure message changed?
+  → Check serializer: apps/eshop/serializers/catalogue.py
+
+  Uncommitted changes:
+    M orders/views.py
+    M orders/serializers.py
+```
 
 ## Configuration
 
-In `main.py`, adjust:
+Edit constants at the top of `main.py`:
 
 ```python
-MIN_ACTIONS_BEFORE_ALERT = 5   # actions before first possible alert
-CONFIDENCE_THRESHOLD = 0.85    # minimum confidence to fire
-COOLDOWN_ACTIONS = 8           # actions between alerts
+CONFIDENCE_THRESHOLD = 0.80      # minimum model confidence to fire
+COOLDOWN_BETWEEN_ALERTS = 5      # tool calls between alerts
+MINIMUM_ACTIONS = 3              # actions before first alert
 ```
 
-## How it works
+## Training
 
-The model is a 101K parameter RWKV-7 trained on 80,000+ real coding agent traces from SWE-bench. Each tool call becomes two tokens (tool type + target hash). The model scans the sequence and classifies the session into one of 5 patterns.
+```bash
+# Pattern classifier (synthetic traces, 9 classes)
+uv run training/train_classifier.py
 
-Accuracy: 92% overall, 99% on successful sessions (zero false alarms), 78-95% on stuck patterns.
+# Success predictor (real SWE-bench outcomes, binary)
+uv run training/train_success.py             # 8K trajectories (fast)
+uv run training/train_success.py --limit 0  # all ~84K (slow)
+```
 
-See [MODEL.md](MODEL.md) for training details, architecture, and evaluation.
+## Project structure
+
+```
+main.py                     — PostToolUse hook entry point
+install.sh                  — one-command installer
+weights/
+  classifier.npz            — 9-class pattern detector weights
+  success.npz               — P(success) predictor weights
+
+src/godel_rwkv/
+  model.py                  — RWKV-7 architecture
+
+training/
+  train_classifier.py       — pattern classifier training
+  train_success.py          — SWE-bench success predictor training
+  generate_mock.py          — synthetic trace generator
+  eval.py                   — offline evaluation
+```
 
 ## Uninstall
 
@@ -101,24 +123,4 @@ Remove the PostToolUse entry from `~/.claude/settings.json` and:
 
 ```bash
 rm -rf ~/.godel-rwkv ~/.cache/godel-rwkv
-```
-
-## Project structure
-
-```
-main.py                 — the supervisor (PostToolUse hook entry point)
-install.sh              — one-command installer
-weights/multiclass.npz  — trained model weights (committed)
-
-src/godel_rwkv/         — model library
-  model.py              — RWKV-7 architecture (binary + multi-class)
-  ski.py                — v2 trace encoding (buckets, COLLAPSE, result tail)
-  lambda_calculus.py    — lambda calculus formal system
-  turing_machine.py     — Turing machine formal system
-  curriculum.py         — training data generators + evaluation battery
-
-training/               — training scripts (not needed to run the tool)
-  train_binary.py       — binary STUCK/SOLVED training
-  train_multiclass.py   — multi-class pattern training
-  convert_swe.py        — SWE-bench trajectory converter
 ```

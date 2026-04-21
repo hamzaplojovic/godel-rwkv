@@ -1,7 +1,7 @@
 [project]
 name = "godel-rwkv"
 version = "0.2.0"
-description = "Claude Code stuck-pattern supervisor — a 101K param RWKV-7 that watches tool calls and catches loops before you waste time"
+description = "RWKV-7 trading regime classifier — tiny model, raw order flow, BTC/USDT market regimes"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -23,7 +23,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/godel_rwkv"]
+packages = ["src/godel_rwkv", "src/navigator_core", "src/trading_navigator"]
 
 [tool.ruff]
 target-version = "py312"

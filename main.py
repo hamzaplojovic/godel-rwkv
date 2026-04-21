@@ -1,32 +1,31 @@
 #!/usr/bin/env python3
-#
-# GodelRWKV — Claude Code stuck-pattern supervisor.
-#
-# Runs as a PostToolUse hook. After every tool call, feeds the action into
-# a 101K param RWKV-7 that classifies stuck patterns in real time.
-#
-# When stuck detected at high confidence:
-#   1. Identifies pattern (LOOP, EDIT_REVERT, READ_CYCLE, TEST_FAIL_LOOP)
-#   2. Gathers git history, related files, recent changes
-#   3. Outputs diagnostic → injected into Claude's conversation → Claude pivots
-#
-# Install:
-#   curl -sL https://raw.githubusercontent.com/hamzaplojovic/godel-rwkv/main/install.sh | bash
-#
+"""
+main.py — GodelRWKV supervisor for Claude Code.
 
+PostToolUse hook: reads tool-call JSON from stdin, maintains session state,
+detects stuck patterns, and emits actionable diagnostics.
+
+Two models (both optional — degrade gracefully if weights missing):
+  classifier  weights/classifier.npz   9-class pattern detector
+  success     weights/success.npz      binary P(success) trained on SWE-bench
+
+Patterns detected:
+  LOOP          exact (tool, target) repeated 4+ times
+  EDIT_REVERT   same file edited repeatedly, tests still failing
+  READ_CYCLE    same file read repeatedly without edits
+  TEST_FAIL_LOOP test command repeated, keeps failing
+  DRIFT         started on module A, pivoted to unrelated module B
+  THRASH        Edit A → Edit B → Edit A → Edit B repeated
+  SCOPE_CREEP   edits spread to 6+ files, no tests run
+  ABANDONED     edits stopped, session now passive reads only
+
+Install:
+  curl -sL https://raw.githubusercontent.com/hamzaplojovic/godel-rwkv/main/install.sh | bash
+"""
 from __future__ import annotations
 
 import hashlib
 import json
-
-# Canary: write to log on every invocation — proves hook is being called at all
-import os as _os
-import time as _time
-from pathlib import Path as _Path
-_log = _Path.home() / ".cache" / "godel-rwkv" / "invocations.log"
-_log.parent.mkdir(parents=True, exist_ok=True)
-with _log.open("a") as _f:
-    _f.write(f"{_time.time():.0f} pid={_os.getpid()} ppid={_os.getppid()}\n")
 import os
 import subprocess
 import sys
@@ -35,336 +34,514 @@ from collections import Counter
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Constants
+# Model constants (must match training/train_multiclass.py)
 # ---------------------------------------------------------------------------
+TOOL_TOKENS = {"Read": 0, "Edit": 1, "Write": 2, "Bash": 3, "Grep": 4, "Glob": 5, "Agent": 6}
+TARGET_BUCKET_BASE = 7
+N_TARGET_BUCKETS = 32
+MC_COLLAPSE = 39
+MC_END = 40
+MC_PAD = 41
+MC_CLS = 42
+MC_VOCAB_SIZE = 43
+MC_MAX_SEQ = 80
 
-# Vocabulary tokens (must match training/train_multiclass.py)
-TOOL_NAME_TO_TOKEN = {"Read": 0, "Edit": 1, "Write": 2, "Bash": 3, "Grep": 4, "Glob": 5, "Agent": 6}
-TARGET_BUCKET_OFFSET = 7
-TARGET_BUCKET_COUNT = 32
-TOKEN_END = 40
-TOKEN_PAD = 41
-TOKEN_CLS = 42
-VOCABULARY_SIZE = 43
-MAX_SEQUENCE_LENGTH = 80
-
-PATTERN_NAMES = ["SOLVED", "LOOP", "EDIT_REVERT", "READ_CYCLE", "TEST_FAIL_LOOP"]
-TRACKABLE_TOOLS = {"Read", "Edit", "Write", "Bash", "Grep", "Glob", "Agent"}
-
-# Behavior tuning
-WEIGHTS_PATH = Path(__file__).parent / "weights" / "multiclass.npz"
-SESSION_STATE_DIR = Path.home() / ".cache" / "godel-rwkv"
-MINIMUM_ACTIONS_BEFORE_ALERT = 5
-CONFIDENCE_THRESHOLD = 0.85
-COOLDOWN_BETWEEN_ALERTS = 8
-SESSION_EXPIRY_SECONDS = 3600
-
-# Django/DRF architectural layers to cross-reference when stuck
-ARCHITECTURAL_LAYERS = ["serializers", "views", "models", "services", "tasks"]
-
-# Module names too generic to search for importers
-GENERIC_MODULE_NAMES = ("__init__", "models", "views", "urls")
-
+D_MODEL = 48
+N_LAYERS = 3
+N_HEADS = 4
+N_CLASSES = 9
+CLASS_NAMES = [
+    "SOLVED", "LOOP", "EDIT_REVERT", "READ_CYCLE", "TEST_FAIL_LOOP",
+    "DRIFT", "THRASH", "SCOPE_CREEP", "ABANDONED",
+]
 
 # ---------------------------------------------------------------------------
-# Model loading (lazy — only imported when prediction is needed)
+# Supervisor config
 # ---------------------------------------------------------------------------
+CONFIDENCE_THRESHOLD = 0.80
+COOLDOWN_BETWEEN_ALERTS = 5
+MINIMUM_ACTIONS = 3
 
-_model_cache: dict = {}
+# Context budget warnings (cumulative tool calls in session)
+BUDGET_WARN_1 = 50
+BUDGET_WARN_2 = 70
+BUDGET_WARN_3 = 90
 
+# Read:Edit ratio alarm
+READ_STALL_RATIO = 10          # >10 reads since last edit → READ_STALL
+READ_STALL_MIN_READS = 5       # only fire after at least this many reads
 
-def load_model():
-    if "model" not in _model_cache:
-        from godel_rwkv.model import GodelRWKV
+# Early warning: fire on 2nd repeat (not 3rd)
+EARLY_REPEAT_THRESHOLD = 1
 
-        m = GodelRWKV(vocab_size=VOCABULARY_SIZE, d_model=48, n_layers=3, n_heads=4, n_classes=5)
-        m.load_weights(str(WEIGHTS_PATH))
-        _model_cache["model"] = m
-    return _model_cache["model"]
+SESSION_DIR = Path.home() / ".cache" / "godel-rwkv"
+SESSION_TTL = 3600  # seconds
 
-
-# ---------------------------------------------------------------------------
-# Session state (persists across hook calls via filesystem)
-# ---------------------------------------------------------------------------
-
-
-def session_state_path() -> Path:
-    # Each Claude Code process gets its own state file keyed by parent PID
-    SESSION_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    return SESSION_STATE_DIR / f"session_{os.getppid()}.json"
-
-
-def create_empty_state() -> dict:
-    return {"started_at": time.time(), "actions": [], "last_alert_action_index": 0, "total_alerts_fired": 0}
-
-
-def read_session_state() -> dict:
-    path = session_state_path()
-    if not path.exists():
-        return create_empty_state()
-    try:
-        state = json.loads(path.read_text())
-        if time.time() - state.get("started_at", 0) > SESSION_EXPIRY_SECONDS:
-            return create_empty_state()
-        return state
-    except (json.JSONDecodeError, KeyError):
-        return create_empty_state()
-
-
-def write_session_state(state: dict) -> None:
-    session_state_path().write_text(json.dumps(state))
-
+WEIGHTS_PATH = Path(__file__).parent / "weights" / "classifier.npz"
+SUCCESS_WEIGHTS_PATH = Path(__file__).parent / "weights" / "success.npz"
 
 # ---------------------------------------------------------------------------
-# Encoding: tool actions → model input tokens
+# Encoding
 # ---------------------------------------------------------------------------
 
-
-def hash_target_to_bucket(target: str) -> int:
-    # SHA-256 the target string, take first 8 hex chars, map to bucket range 7-38
-    digest = hashlib.sha256(target.encode()).hexdigest()[:8]
-    return TARGET_BUCKET_OFFSET + (int(digest, 16) % TARGET_BUCKET_COUNT)
+def _target_bucket(target: str) -> int:
+    h = int(hashlib.sha256(target.encode()).hexdigest()[:8], 16)
+    return TARGET_BUCKET_BASE + (h % N_TARGET_BUCKETS)
 
 
-def extract_tool_target(tool_name: str, tool_arguments: dict) -> str:
-    # For file tools: the path. For Bash: first two words. For search: the pattern.
-    if tool_name in ("Read", "Write", "Edit"):
-        return tool_arguments.get("file_path", "")
-    if tool_name == "Bash":
-        return " ".join(tool_arguments.get("command", "").split()[:2])
-    if tool_name in ("Grep", "Glob"):
-        return tool_arguments.get("pattern", "")
-    return tool_name
-
-
-def predict_pattern(actions: list[tuple[str, str]]) -> tuple[str, float]:
-    # Encode: two tokens per action (tool type + target bucket), then END + CLS
-    # Pad from left, keep the tail (most recent actions matter most)
-    import mlx.core as mx
-
+def _encode(actions: list[tuple[str, str]]) -> list[int]:
     tokens = []
-    for tool_name, target in actions:
-        tokens.append(TOOL_NAME_TO_TOKEN.get(tool_name, 3))
-        tokens.append(hash_target_to_bucket(target))
-    tokens += [TOKEN_END, TOKEN_CLS]
+    for tool, tgt in actions:
+        tokens.append(TOOL_TOKENS.get(tool, 3))
+        tokens.append(_target_bucket(tgt))
+    tokens.append(MC_END)
+    return tokens
 
-    if len(tokens) > MAX_SEQUENCE_LENGTH:
-        tokens = tokens[-MAX_SEQUENCE_LENGTH:]
-    tokens = [TOKEN_PAD] * (MAX_SEQUENCE_LENGTH - len(tokens)) + tokens
 
-    model = load_model()
-    logits = model(mx.array([tokens], dtype=mx.int32))
-    probabilities = mx.softmax(logits, axis=-1)
-    mx.eval(logits, probabilities)
-
-    predicted_class = int(mx.argmax(logits, axis=-1).item())
-    confidence = float(probabilities[0, predicted_class].item())
-    return PATTERN_NAMES[predicted_class], confidence
+def _pad(toks: list[int]) -> list[int]:
+    toks = toks + [MC_CLS]
+    if len(toks) > MC_MAX_SEQ:
+        toks = toks[-MC_MAX_SEQ:]
+    return [MC_PAD] * (MC_MAX_SEQ - len(toks)) + toks
 
 
 # ---------------------------------------------------------------------------
-# Context gathering: look at the codebase when stuck is detected
+# Model loading (lazy — only on first alert)
 # ---------------------------------------------------------------------------
 
+_model = None
+_success_model = None
 
-def run_shell(command: str, timeout_seconds: int = 3) -> str:
+
+def _load_model():
+    global _model
+    if _model is not None:
+        return _model
+    if not WEIGHTS_PATH.exists():
+        return None
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout_seconds)
-        return result.stdout.strip()
-    except (subprocess.TimeoutExpired, OSError):
+        import mlx.core as mx
+
+        from godel_rwkv.model import GodelRWKV
+        m = GodelRWKV(
+            vocab_size=MC_VOCAB_SIZE, d_model=D_MODEL,
+            n_layers=N_LAYERS, n_heads=N_HEADS, n_classes=N_CLASSES,
+        )
+        m.load_weights(str(WEIGHTS_PATH))
+        mx.eval(m.parameters())
+        _model = m
+    except Exception:  # noqa: BLE001
+        return None
+    return _model
+
+
+def _load_success_model():
+    global _success_model
+    if _success_model is not None:
+        return _success_model
+    if not SUCCESS_WEIGHTS_PATH.exists():
+        return None
+    try:
+        import mlx.core as mx
+        from godel_rwkv.model import GodelRWKV
+        m = GodelRWKV(
+            vocab_size=MC_VOCAB_SIZE, d_model=D_MODEL,
+            n_layers=N_LAYERS, n_heads=N_HEADS, n_classes=1,
+        )
+        m.load_weights(str(SUCCESS_WEIGHTS_PATH))
+        mx.eval(m.parameters())
+        _success_model = m
+    except Exception:  # noqa: BLE001
+        return None
+    return _success_model
+
+
+def _predict_success(actions: list[tuple[str, str]]) -> float | None:
+    """Return P(success) in [0, 1] or None if model unavailable."""
+    model = _load_success_model()
+    if model is None:
+        return None
+    try:
+        import mlx.core as mx
+        import mlx.nn as nn
+        toks = _encode(actions)
+        x = mx.array([_pad(toks)], dtype=mx.int32)
+        logit = model(x)
+        prob = nn.sigmoid(logit).item()
+        return float(prob)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _predict(actions: list[tuple[str, str]]) -> tuple[int, float] | None:
+    """Return (class_id, confidence) or None if model unavailable."""
+    model = _load_model()
+    if model is None:
+        return None
+    try:
+        import mlx.core as mx
+        import mlx.nn as nn
+        toks = _encode(actions)
+        x = mx.array([_pad(toks)], dtype=mx.int32)
+        logits = model(x)
+        probs = nn.softmax(logits, axis=-1)
+        mx.eval(probs)
+        probs_np = probs[0].tolist()
+        best = max(range(N_CLASSES), key=lambda i: probs_np[i])
+        return best, probs_np[best]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
+
+def _session_path() -> Path:
+    ppid = os.getenv("PPID") or str(os.getppid())
+    return SESSION_DIR / f"session_{ppid}.json"
+
+
+def _load_session() -> dict:
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    path = _session_path()
+    if path.exists():
+        try:
+            s = json.loads(path.read_text())
+            if time.time() - s.get("ts", 0) < SESSION_TTL:
+                return s
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return {
+        "actions": [],       # list of [tool, target]
+        "ts": time.time(),
+        "last_alert": -999,
+        "total_calls": 0,
+        "budget_warned": [],   # which budget thresholds already warned
+        "reads_since_edit": 0,
+        "read_stall_warned": False,
+    }
+
+
+def _save_session(s: dict) -> None:
+    s["ts"] = time.time()
+    _session_path().write_text(json.dumps(s))
+
+
+# ---------------------------------------------------------------------------
+# Codebase context
+# ---------------------------------------------------------------------------
+
+def _run(cmd: list[str], cwd: str | None = None) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3, cwd=cwd)
+        return r.stdout.strip()
+    except Exception:  # noqa: BLE001
         return ""
 
 
-def _gather_git_context(stuck_file: str) -> dict:
-    context: dict = {}
-    last_commit = run_shell(f"git log -1 --format='%an, %ar: %s' -- '{stuck_file}' 2>/dev/null")
-    if last_commit:
-        context["last_commit"] = last_commit
-    recent_history = run_shell(f"git log --oneline -5 -- '{stuck_file}' 2>/dev/null")
-    if recent_history:
-        context["recent_history"] = recent_history
-    parent_directory = str(Path(stuck_file).parent)
-    if parent_directory and parent_directory != ".":
-        sibling_changes = run_shell(f"git log --oneline -3 --diff-filter=M -- '{parent_directory}/' 2>/dev/null")
-        if sibling_changes:
-            context["sibling_changes"] = sibling_changes
-    return context
+def gather_codebase_context(target: str) -> dict:
+    """Gather git context and architectural neighbours for a file target."""
+    ctx: dict = {}
 
+    # Recent commits touching this file
+    if target and not target.startswith("pytest") and " " not in target[:8]:
+        log = _run(["git", "log", "--oneline", "-5", "--", target])
+        if log:
+            ctx["recent_commits"] = log
 
-def _gather_related_layers(stuck_file: str) -> dict:
-    related_files = {}
-    for layer in ARCHITECTURAL_LAYERS:
-        if layer in stuck_file:
-            continue
-        candidate = stuck_file.replace(Path(stuck_file).parts[-1], f"{layer}.py")
-        if Path(candidate).exists():
-            change_info = run_shell(f"git log -1 --format='%ar: %s' -- '{candidate}' 2>/dev/null")
-            if change_info:
-                related_files[layer] = {"file": candidate, "last_change": change_info}
-    return related_files
+    # Sibling files (same directory)
+    if target and "/" in target:
+        parent = str(Path(target).parent)
+        siblings = _run(["git", "ls-files", parent])
+        if siblings:
+            ctx["sibling_files"] = siblings.split("\n")[:8]
 
-
-def gather_codebase_context(stuck_file: str, actions: list[tuple[str, str]]) -> dict:
-    context: dict = {}
-
-    if not stuck_file or not Path(stuck_file).exists():
-        return context
-
-    test_commands = [
-        target for tool, target in actions if tool == "Bash" and any(k in target for k in ["pytest", "test", "npm run"])
+    # Architectural layers
+    arch_patterns = [
+        ("serializers", "serializers.py"),
+        ("views", "views.py"),
+        ("models", "models.py"),
+        ("services", "services.py"),
     ]
-    if test_commands:
-        context["last_test_command"] = test_commands[-1]
+    for layer, pattern in arch_patterns:
+        found = _run(["git", "ls-files", f"*{pattern}"])
+        if found:
+            ctx[layer] = found.split("\n")[:3]
+            break  # only include closest layer match
 
-    context.update(_gather_git_context(stuck_file))
-
-    related_files = _gather_related_layers(stuck_file)
-    if related_files:
-        context["related_layers"] = related_files
-
-    module_name = Path(stuck_file).stem
-    if module_name not in GENERIC_MODULE_NAMES:
-        importers = run_shell(
-            f"grep -rl 'from.*{module_name}\\|import.*{module_name}' --include='*.py' . 2>/dev/null | head -5"
-        )
+    # Who imports this file
+    if target and "/" in target:
+        module = target.replace("/", ".").removesuffix(".py")
+        importers = _run(["grep", "-rl", module, "src/", "--include=*.py"])
         if importers:
-            context["imported_by"] = importers
+            ctx["imported_by"] = importers.split("\n")[:3]
 
-    return context
+    # Current git status
+    status = _run(["git", "status", "--short"])
+    if status:
+        ctx["git_status"] = status.split("\n")[:5]
+
+    return ctx
 
 
 # ---------------------------------------------------------------------------
-# Diagnosis: the message injected into Claude's conversation
+# Diagnostics
 # ---------------------------------------------------------------------------
 
+_DRIFT_MSG = """\
+DRIFT detected: session started on one module but has been working on an
+unrelated module for the past several steps. Consider:
+  • Did the original task get resolved? If so, commit and start fresh.
+  • If still unresolved, return to the original files.
+  • If the pivot was intentional, note it in a comment so context is clear."""
 
-def _format_context_section(context: dict) -> str:
-    lines = ["\n--- Context ---\n"]
-    if context.get("last_test_command"):
-        lines.append(f"Last test: {context['last_test_command']}\n")
-    if context.get("last_commit"):
-        lines.append(f"Last modified by: {context['last_commit']}\n")
-    if context.get("recent_history"):
-        lines.append(f"Recent history:\n{context['recent_history']}\n")
-    if context.get("sibling_changes"):
-        lines.append(f"Recent changes in same directory:\n{context['sibling_changes']}\n")
-    if context.get("related_layers"):
-        lines.append("\nRelated layers:\n")
-        for layer_name, layer_info in context["related_layers"].items():
-            lines.append(f"  {layer_name}: {layer_info['file']} (changed {layer_info['last_change']})\n")
-    if context.get("imported_by"):
-        lines.append(f"\nImported by:\n{context['imported_by']}\n")
-    return "".join(lines)
+_THRASH_MSG = """\
+THRASH detected: ping-ponging between two files without resolution.
+  • Decide which file owns the logic change — make it there only.
+  • If both files need updating, write a plan before touching either."""
+
+_SCOPE_CREEP_MSG = """\
+SCOPE_CREEP detected: edits spreading across many files without test runs.
+  • Stop editing. Run the tests now to see current state.
+  • Fix one file at a time, test between each change."""
+
+_ABANDONED_MSG = """\
+ABANDONED pattern: edits stopped, session is now passive (reads/greps only).
+  • Are you stuck? What is the specific blocker?
+  • Run the tests to confirm current state before exploring further."""
 
 
-def _format_suggestion(pattern: str, stuck_file: str, context: dict) -> str:
-    if pattern == "READ_CYCLE":
-        return "You have enough context. Make a decision — edit something or look at a DIFFERENT file.\n"
-    if pattern in ("EDIT_REVERT", "TEST_FAIL_LOOP"):
-        return _format_edit_revert_suggestion(stuck_file, context)
+def build_diagnostic_message(pattern: str, actions: list[tuple[str, str]], ctx: dict) -> str:
+    # Most frequent target for the stuck pattern
+    if actions:
+        target_counts = Counter(tgt for _, tgt in actions[-20:])
+        top_target = target_counts.most_common(1)[0][0]
+    else:
+        top_target = ""
+
+    lines = [f"⚠  GodelRWKV detected: {pattern}"]
+    lines.append("")
+
+    if pattern == "LOOP":
+        lines.append(f"  Exact action repeated on: {top_target}")
+        lines.append("  → Step back. What is the root blocker?")
+
+    elif pattern == "EDIT_REVERT":
+        lines.append(f"  Repeatedly editing without resolution: {top_target}")
+        lines.append("  → Read the full error. Has the failure message changed?")
+        if ctx.get("serializers"):
+            lines.append(f"  → Check serializer: {ctx['serializers'][0]}")
+
+    elif pattern == "READ_CYCLE":
+        lines.append(f"  Reading same file repeatedly: {top_target}")
+        lines.append("  → What information are you looking for? Search for it with Grep.")
+        if ctx.get("imported_by"):
+            lines.append(f"  → Also check callers: {', '.join(ctx['imported_by'][:2])}")
+
+    elif pattern == "TEST_FAIL_LOOP":
+        lines.append(f"  Test command keeps failing: {top_target}")
+        lines.append("  → Run with -x --tb=long to see the first failure in full.")
+        if ctx.get("recent_commits"):
+            lines.append(f"  → Last commits on this path:\n{ctx['recent_commits']}")
+
+    elif pattern == "DRIFT":
+        lines.append(_DRIFT_MSG)
+        if len(actions) > 10:
+            early = Counter(tgt for _, tgt in actions[:len(actions)//2])
+            late  = Counter(tgt for _, tgt in actions[len(actions)//2:])
+            early_top = early.most_common(1)[0][0] if early else ""
+            late_top  = late.most_common(1)[0][0] if late else ""
+            if early_top != late_top:
+                lines.append(f"  Early focus: {early_top}")
+                lines.append(f"  Recent focus: {late_top}")
+
+    elif pattern == "THRASH":
+        lines.append(_THRASH_MSG)
+        recent = actions[-10:]
+        files_seen = list(dict.fromkeys(tgt for _, tgt in recent if tgt))
+        if len(files_seen) >= 2:
+            lines.append(f"  Bouncing between: {files_seen[0]}  ↔  {files_seen[1]}")
+
+    elif pattern == "SCOPE_CREEP":
+        lines.append(_SCOPE_CREEP_MSG)
+        edited = list(dict.fromkeys(tgt for t, tgt in actions if t in ("Edit", "Write")))
+        lines.append(f"  Files touched ({len(edited)}): {', '.join(edited[:5])}")
+
+    elif pattern == "ABANDONED":
+        lines.append(_ABANDONED_MSG)
+        last_edit = next((tgt for t, tgt in reversed(actions) if t in ("Edit", "Write")), "")
+        if last_edit:
+            lines.append(f"  Last edit: {last_edit}")
+
+    if ctx.get("git_status"):
+        lines.append("")
+        lines.append("  Uncommitted changes:")
+        for s in ctx["git_status"]:
+            lines.append(f"    {s}")
+
+    return "\n".join(lines)
+
+
+def build_budget_warning(total: int) -> str:
+    pct = min(100, int(total / BUDGET_WARN_3 * 100))
     return (
-        "You're repeating actions without progress. Try:\n"
-        "1. Re-read the original task/error message\n"
-        "2. Look at a completely different file\n"
-        "3. Check if a recent commit broke something (see git history above)\n"
+        f"⚠  Context budget: {total} tool calls this session (~{pct}% of safe limit).\n"
+        "   Consider committing progress and continuing in a new session."
     )
 
 
-def _format_edit_revert_suggestion(stuck_file: str, context: dict) -> str:
-    layer_infos = context.get("related_layers", {})
-    if not layer_infos:
-        return (
-            f"Your edits to {stuck_file} aren't fixing it. Root cause is probably in a different file.\n"
-            "Read the test error carefully — what module/function is actually failing?\n"
-        )
-    layer_files = [layer_infos[name]["file"] for name in list(layer_infos.keys())[:2]]
-    lines = [
-        f"You've been editing {stuck_file} repeatedly. The bug might be in a different layer.\n",
-        f"Check: {', '.join(layer_files)}\n",
-    ]
-    recently_changed = [
-        (name, info)
-        for name, info in layer_infos.items()
-        if "day" in info.get("last_change", "") or "hour" in info.get("last_change", "")
-    ]
-    if recently_changed:
-        lines.append(f"⚡ {recently_changed[0][1]['file']} was changed recently — likely suspect.\n")
-    return "".join(lines)
-
-
-def build_diagnostic_message(pattern: str, actions: list[tuple[str, str]], confidence: float) -> str:
-    file_actions = [(tool, target) for tool, target in actions if tool in ("Read", "Edit", "Write")]
-    file_touch_counts = Counter(target for _, target in file_actions)
-    most_touched = file_touch_counts.most_common(1)
-
-    stuck_file = most_touched[0][0] if most_touched else ""
-    touch_count = most_touched[0][1] if most_touched else 0
-    context = gather_codebase_context(stuck_file, actions)
-
-    header = f"⚠ STUCK: {pattern} (confidence: {confidence:.0%})\n"
-    if stuck_file:
-        header += f"File: {stuck_file} (touched {touch_count}x)\n"
-
+def build_read_stall_warning(reads: int, last_edit_target: str) -> str:
     return (
-        header
-        + _format_context_section(context)
-        + "\n--- Suggestion ---\n"
-        + _format_suggestion(pattern, stuck_file, context)
+        f"⚠  Read stall: {reads} consecutive reads without an edit.\n"
+        f"   Last edited: {last_edit_target or 'unknown'}\n"
+        "   → Are you searching for something? Use Grep instead of repeated reads."
     )
 
 
 # ---------------------------------------------------------------------------
-# Entry point: called by Claude Code after every tool use
+# Early-repeat heuristic (fires before model confidence threshold)
 # ---------------------------------------------------------------------------
 
+def check_early_repeat(actions: list[tuple[str, str]]) -> str | None:
+    """Return pattern name if a stuck pattern is detectable in recent actions."""
+    if len(actions) < EARLY_REPEAT_THRESHOLD + 1:
+        return None
+    recent = actions[-15:]
+
+    # Exact (tool, target) repeat
+    counts = Counter(recent)
+    top, n = counts.most_common(1)[0]
+    if n > EARLY_REPEAT_THRESHOLD:
+        tool, target = top
+        if tool == "Edit":
+            return "EDIT_REVERT"
+        if tool == "Read":
+            return "READ_CYCLE"
+        if tool == "Bash" and any(p in target for p in ["pytest", "npm test", "python -m pytest"]):
+            return "TEST_FAIL_LOOP"
+        return "LOOP"
+
+    # THRASH: alternating between exactly two targets
+    if len(recent) >= 6:
+        targets = [tgt for _, tgt in recent if tgt]
+        unique = list(dict.fromkeys(targets))
+        if len(unique) == 2:
+            pattern = [targets[i] == unique[i % 2] for i in range(len(targets))]
+            if sum(pattern) >= len(targets) - 1:
+                return "THRASH"
+
+    # ABANDONED: last 6 actions all passive (no Edit/Write/Bash)
+    if len(actions) >= 8:
+        last6 = actions[-6:]
+        if all(t in ("Read", "Grep", "Glob") for t, _ in last6):
+            has_prior_edit = any(t in ("Edit", "Write") for t, _ in actions[:-6])
+            if has_prior_edit:
+                return "ABANDONED"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    # Parse hook input from stdin
+    raw = sys.stdin.read().strip()
+    if not raw:
+        return
+
     try:
-        hook_input = json.loads(sys.stdin.read())
-    except (json.JSONDecodeError, EOFError):
+        event = json.loads(raw)
+    except json.JSONDecodeError:
         return
 
-    tool_name = hook_input.get("tool_name", "")
-    tool_arguments = hook_input.get("tool_input", {})
+    tool_name = event.get("tool_name", "") or event.get("tool", "")
+    tool_input = event.get("tool_input") or event.get("input") or {}
 
-    if tool_name not in TRACKABLE_TOOLS:
-        return
+    # Resolve target string
+    target = (
+        tool_input.get("file_path")
+        or tool_input.get("path")
+        or tool_input.get("command")
+        or tool_input.get("pattern")
+        or ""
+    )
 
-    # Record this action
-    state = read_session_state()
-    target = extract_tool_target(tool_name, tool_arguments)
-    state["actions"].append([tool_name, target])
-    action_count = len(state["actions"])
+    s = _load_session()
+    s["actions"].append([tool_name, target])
+    s["total_calls"] = s.get("total_calls", 0) + 1
 
-    # Guard: not enough actions yet
-    if action_count < MINIMUM_ACTIONS_BEFORE_ALERT:
-        write_session_state(state)
-        return
+    # Track read:edit ratio
+    if tool_name == "Edit" or tool_name == "Write":
+        s["reads_since_edit"] = 0
+        s["read_stall_warned"] = False
+        s["_last_edit_target"] = target
+    elif tool_name == "Read":
+        s["reads_since_edit"] = s.get("reads_since_edit", 0) + 1
 
-    # Guard: cooldown between alerts
-    if action_count - state["last_alert_action_index"] < COOLDOWN_BETWEEN_ALERTS:
-        write_session_state(state)
-        return
+    total_calls = s["total_calls"]
+    actions = [tuple(a) for a in s["actions"]]
+    step = len(actions)
+    last_alert = s.get("last_alert", -999)
 
-    # Run prediction
-    try:
-        pattern, confidence = predict_pattern(state["actions"][-20:])
-    except Exception:
-        write_session_state(state)
-        return
+    output: list[str] = []
 
-    # Guard: only fire on stuck patterns with high confidence
-    if pattern == "SOLVED" or confidence < CONFIDENCE_THRESHOLD:
-        write_session_state(state)
-        return
+    # --- Context budget warnings ---
+    warned = s.get("budget_warned", [])
+    for threshold in [BUDGET_WARN_1, BUDGET_WARN_2, BUDGET_WARN_3]:
+        if total_calls >= threshold and threshold not in warned:
+            output.append(build_budget_warning(total_calls))
+            warned.append(threshold)
+    s["budget_warned"] = warned
 
-    # Fire alert
-    state["last_alert_action_index"] = action_count
-    state["total_alerts_fired"] += 1
-    write_session_state(state)
+    # --- Read stall ---
+    reads_since_edit = s.get("reads_since_edit", 0)
+    if (reads_since_edit >= READ_STALL_MIN_READS
+            and reads_since_edit % READ_STALL_RATIO == 0
+            and not s.get("read_stall_warned")):
+        output.append(build_read_stall_warning(reads_since_edit, s.get("_last_edit_target", "")))
+        s["read_stall_warned"] = True
 
-    print(build_diagnostic_message(pattern, state["actions"], confidence))
+    # --- Stuck pattern detection (only if enough actions + cooldown) ---
+    if step >= MINIMUM_ACTIONS and (step - last_alert) >= COOLDOWN_BETWEEN_ALERTS:
+        alert_pattern: str | None = None
+        confidence = 0.0
+
+        # 1. Early-repeat heuristic (fast, no model)
+        early = check_early_repeat(actions)
+        if early:
+            alert_pattern = early
+            confidence = 1.0  # heuristic: treat as certain
+
+        # 2. Model inference (if no early heuristic fired)
+        if alert_pattern is None:
+            result = _predict(actions)
+            if result is not None:
+                pred, conf = result
+                if pred != 0 and conf >= CONFIDENCE_THRESHOLD:
+                    alert_pattern = CLASS_NAMES[pred]
+                    confidence = conf
+
+        if alert_pattern:
+            ctx = gather_codebase_context(target)
+            msg = build_diagnostic_message(alert_pattern, actions, ctx)
+            conf_str = f" (confidence: {confidence:.0%})" if confidence < 1.0 else ""
+            output.append(f"{msg}{conf_str}")
+            s["last_alert"] = step
+
+        # P(success) from SWE-bench success model (only when no pattern alert fired)
+        if not alert_pattern:
+            p_success = _predict_success(actions)
+            if p_success is not None and p_success < 0.25:
+                output.append(
+                    f"⚠  Trajectory confidence: {p_success:.0%} — session pattern resembles failed SWE-bench attempts."
+                )
+
+    _save_session(s)
+
+    if output:
+        print("\n".join(output), flush=True)
 
 
 if __name__ == "__main__":
