@@ -310,7 +310,7 @@ def main() -> None:
     for step in range(1, MAX_STEPS + 1):
         x, y = sample_batch(train_seqs, train_labels, rng, BATCH_SIZE)
         loss, grads = loss_and_grad(model, x, y)
-        grads = optim.clip_grad_norm(grads, GRAD_CLIP)
+        grads = optim.clip_grad_norm(grads, GRAD_CLIP)[0]
         optimizer.update(model, grads)
         mx.eval(model.parameters(), optimizer.state)
 
